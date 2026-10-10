@@ -10,10 +10,12 @@ import argparse
 import asyncio
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -32,11 +34,24 @@ from core.config import (
     normalize_model_id,
 )
 
+# Guest images the microsandbox tier can run. The first is the operator-built
+# image from ./install.sh (sandbox/Dockerfile); the fallbacks are the pinned
+# base images install.sh pulls directly when no container builder is present
+# (mirror.gcr.io first because some networks block Docker Hub). Keep this list
+# in sync with the FALLBACK_IMAGES list in install.sh.
+MICROSANDBOX_DEFAULT_IMAGE = "mantis-sandbox:latest"
+MICROSANDBOX_FALLBACK_IMAGES = (
+    "mirror.gcr.io/library/python:3-slim",
+    "docker.io/library/python:3-slim",
+)
+
 
 def get_local_workflow_path(base_workflow_path: str) -> str:
-    """Returns path to workflow.local.json adjacent to base workflow path."""
+    """Returns path to local workflow overlay adjacent to base workflow path."""
     base_dir = os.path.dirname(os.path.abspath(base_workflow_path))
-    return os.path.join(base_dir, "workflow.local.json")
+    base_name = os.path.basename(base_workflow_path)
+    stem = base_name[:-5] if base_name.endswith(".json") else base_name
+    return os.path.join(base_dir, f"{stem}.local.json")
 
 
 def merge_dicts(base: dict, overlay: dict) -> dict:
@@ -53,6 +68,9 @@ def merge_dicts(base: dict, overlay: dict) -> dict:
             new_type = v.get("type", base_type)
             if new_type in ("static-only", "static"):
                 merged["sandbox"] = {"type": new_type, "options": {}}
+                sb_proj = v.get("options", {}).get("project") if isinstance(v.get("options"), dict) else None
+                if sb_proj and not merged.get("project"):
+                    merged["project"] = sb_proj
             elif new_type != base_type or ("options" in v and v["options"] == {}):
                 merged["sandbox"] = dict(v)
                 if "options" not in merged["sandbox"] or not isinstance(merged["sandbox"]["options"], dict):
@@ -73,24 +91,26 @@ def merge_dicts(base: dict, overlay: dict) -> dict:
 
 
 def find_workflow_json(custom_path: str = "") -> str:
-    """Discovers workflow.json across standard workspace and repository locations."""
+    """Discovers workflow.json across standard reference package locations.
+
+    Never probes untrusted $CWD/workflow.json by default to prevent repository
+    graph hijacking. Explicit custom paths must be supplied via CLI/argument.
+    """
     if custom_path:
         return os.path.abspath(custom_path)
 
-    candidates = [
-        os.path.join(os.getcwd(), "workflow.json"),
-        os.path.join(os.getcwd(), "reference", "workflow.json"),
-        os.path.join(Path(__file__).resolve().parent.parent, "workflow.json"),
-        os.path.join(Path(__file__).resolve().parent.parent.parent, "reference", "workflow.json"),
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            return os.path.abspath(c)
+    # SECURITY (INV-4): every candidate below is derived from __file__ (the installed
+    # package location). $CWD is never probed: launch.py resolves the operator's
+    # configured sandbox through this function, so a workflow.json planted in an
+    # untrusted checkout would otherwise dictate the execution graph and sandbox policy.
+    package_wf = os.path.join(Path(__file__).resolve().parent.parent, "workflow.json")
+    parent_ref_wf = os.path.join(Path(__file__).resolve().parent.parent.parent, "reference", "workflow.json")
 
-    # Fallback to default in reference directory
-    return os.path.abspath(
-        os.path.join(Path(__file__).resolve().parent.parent, "workflow.json")
-    )
+    for candidate in [package_wf, parent_ref_wf]:
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+
+    return os.path.abspath(package_wf)
 
 
 def load_workflow_dict(workflow_path: str, load_local: bool = True) -> dict:
@@ -126,9 +146,11 @@ def load_workflow_dict(workflow_path: str, load_local: bool = True) -> dict:
 
     if load_local:
         base_dir = os.path.dirname(os.path.abspath(workflow_path))
+        base_name = os.path.basename(workflow_path)
+        stem = base_name[:-5] if base_name.endswith(".json") else base_name
         local_candidates = [
-            os.path.join(base_dir, "workflow.local.json"),
-            os.path.join(base_dir, ".workflow.local.json"),
+            os.path.join(base_dir, f"{stem}.local.json"),
+            os.path.join(base_dir, f".{stem}.local.json"),
         ]
         abs_wf = os.path.abspath(workflow_path)
         for cand in local_candidates:
@@ -174,6 +196,74 @@ def load_workflow_dict(workflow_path: str, load_local: bool = True) -> dict:
     return data
 
 
+def check_microsandbox_virtualization() -> Tuple[bool, str]:
+    """Platform-aware check that the microsandbox tier can boot microVMs here.
+
+    Linux: requires a readable/writable /dev/kvm. macOS (Apple Silicon):
+    libkrun rides Hypervisor.framework -- no /dev/kvm exists, the bundled
+    libkrunfw in the microsandbox wheel is the requirement. Mirrors the
+    platform guard in MicrosandboxEnvironment.__init__.
+    """
+    if sys.platform.startswith("linux"):
+        if not os.path.exists("/dev/kvm"):
+            return False, "/dev/kvm device does not exist."
+        if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+            return False, "Current user lacks read/write permissions on /dev/kvm."
+        return True, "KVM virtualization available (/dev/kvm accessible)."
+    if sys.platform == "darwin":
+        if platform.machine() != "arm64":
+            return False, "microsandbox on macOS requires Apple Silicon (arm64)."
+        try:
+            import microsandbox as _msb  # noqa: F401
+        except Exception as e:
+            return False, f"microsandbox package not importable: {e}"
+        return True, "Hypervisor.framework virtualization available (Apple Silicon + microsandbox wheel)."
+    return False, f"microsandbox is not supported on platform '{sys.platform}'."
+
+
+def find_cached_microsandbox_image(preferred: str = "") -> Optional[str]:
+    """Returns the first locally cached guest image usable by the microsandbox tier.
+
+    The runtime boots with PullPolicy.NEVER, so an image missing from the local
+    cache means every reproducer campaign fails at first execute. Checks the
+    operator's configured image first, then the install.sh-built image, then
+    the pinned fallback base images. Returns None when nothing is cached.
+    """
+    candidates = []
+    if preferred:
+        candidates.append(preferred)
+    candidates.append(MICROSANDBOX_DEFAULT_IMAGE)
+    candidates.extend(MICROSANDBOX_FALLBACK_IMAGES)
+
+    async def _probe() -> Optional[str]:
+        from microsandbox import Image, ImageNotFoundError
+
+        for cand in candidates:
+            try:
+                await Image.get(cand)
+                return cand
+            except ImageNotFoundError:
+                continue
+            except Exception:
+                # Cache DB unavailable (locked/permissions): treat as no image
+                # rather than crashing configuration.
+                return None
+        return None
+
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                return executor.submit(asyncio.run, _probe()).result()
+        return asyncio.run(_probe())
+    except Exception:
+        return None
+
+
 def detect_capabilities() -> dict:
     """Inspects the local host environment to detect available sandboxes, tools, and credentials."""
     caps: dict[str, Any] = {
@@ -194,14 +284,18 @@ def detect_capabilities() -> dict:
         "anthropic_api_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "openai_api_key": bool(os.environ.get("OPENAI_API_KEY")),
         "llm_api_base": os.environ.get("LLM_API_BASE"),
+        "microsandbox_image": None,
         "recommended_sandbox": "static-only",
         "available_sandboxes": ["static-only"],
     }
 
-    # 1. Check KVM for microsandbox
-    if os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK):
-        caps["kvm"] = True
+    # 1. Check virtualization for microsandbox (Linux KVM or macOS
+    # Hypervisor.framework -- see check_microsandbox_virtualization).
+    virt_ok, _ = check_microsandbox_virtualization()
+    if virt_ok:
+        caps["kvm"] = os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK)
         caps["available_sandboxes"].append("microsandbox")
+        caps["microsandbox_image"] = find_cached_microsandbox_image()
 
     # 2. Check container engines and gVisor
     for tool in ("docker", "podman"):
@@ -262,13 +356,19 @@ def detect_capabilities() -> dict:
     if caps["gcloud"] and caps["gcp_auth"] and (caps["gcp_project"] or caps["vertex_project"]):
         caps["available_sandboxes"].append("gce")
 
-    # Select recommendation hierarchy
-    if "gce" in caps["available_sandboxes"] and caps["gcp_project"]:
+    # Select recommendation hierarchy. Microsandbox ranks first when a guest
+    # image is cached: it is the only tier whose runnability is fully verified
+    # client-side (hardware microVM + image present), whereas 'gce' merely
+    # having gcloud auth says nothing about the pre-provisioned VPC/subnet/VM
+    # image it needs, and gvisor shares the host kernel. Without a cached
+    # image microsandbox is NOT recommended: the runtime never pulls
+    # (PullPolicy.NEVER), so every campaign would fail at first execute.
+    if "microsandbox" in caps["available_sandboxes"] and caps["microsandbox_image"]:
+        caps["recommended_sandbox"] = "microsandbox"
+    elif "gce" in caps["available_sandboxes"] and caps["gcp_project"]:
         caps["recommended_sandbox"] = "gce"
     elif "gvisor" in caps["available_sandboxes"]:
         caps["recommended_sandbox"] = "gvisor"
-    elif "microsandbox" in caps["available_sandboxes"]:
-        caps["recommended_sandbox"] = "microsandbox"
     else:
         caps["recommended_sandbox"] = "static-only"
 
@@ -300,8 +400,9 @@ def is_default_or_unconfigured(config: dict) -> Tuple[bool, List[str]]:
         if not shutil.which("docker") and not shutil.which("podman"):
             issues.append("gVisor sandbox requires 'docker' or 'podman' on PATH.")
     elif sb_type == "microsandbox":
-        if not os.path.exists("/dev/kvm"):
-            issues.append("Microsandbox requires /dev/kvm virtualization device.")
+        virt_ok, virt_msg = check_microsandbox_virtualization()
+        if not virt_ok:
+            issues.append(f"Microsandbox virtualization unavailable: {virt_msg}")
 
     # Model checks
     model = config.get("default_model", DEFAULT_MODEL)
@@ -381,17 +482,116 @@ async def _check_sandbox_preflight(sandbox_cfg: dict, target_path: str = "") -> 
             return False, f"gVisor check failed: {e}"
 
     if sb_type == "microsandbox":
-        if not os.path.exists("/dev/kvm"):
-            return False, "/dev/kvm device does not exist."
-        if not os.access("/dev/kvm", os.R_OK | os.W_OK):
-            return False, "Current user lacks read/write permissions on /dev/kvm."
-        return True, "Microsandbox ready (/dev/kvm accessible)."
+        virt_ok, virt_msg = check_microsandbox_virtualization()
+        if not virt_ok:
+            return False, virt_msg
+        configured_image = str(sandbox_cfg.get("options", {}).get("image", "") or "")
+        cached = find_cached_microsandbox_image(preferred=configured_image)
+        if configured_image and cached != configured_image:
+            return False, (
+                f"Configured guest image '{configured_image}' is not in the local cache "
+                f"(the sandbox never pulls at run time). Run ./install.sh to provision it."
+            )
+        if not cached:
+            return False, (
+                "No microsandbox guest image found in the local cache "
+                "(the sandbox never pulls at run time). Run ./install.sh to provision one."
+            )
+        return True, f"Microsandbox ready ({virt_msg} Guest image: {cached})."
 
     return False, f"Unknown sandbox type '{sb_type}'."
 
 
-def _check_llm_preflight(config: dict) -> Tuple[bool, str]:
-    """Fast validation of LLM configuration and credentials in ~1s."""
+def _probe_llm_reachability(
+    resolved_model: str,
+    kwargs: dict,
+    prompt: str = "test",
+    max_tokens: int = 256,
+    timeout: float = 15.0,
+) -> Tuple[bool, str]:
+    """Actively probes LLM endpoint reachability, credentials, and dependencies with a minimal test prompt."""
+    try:
+        import litellm
+    except ImportError:
+        return False, "LiteLLM is not installed in the current environment."
+
+    # For Vertex AI partner models (e.g. vertex_ai/claude-*, vertex_ai/zai_org/*),
+    # verify that required client dependencies are installed
+    if resolved_model.startswith("vertex_ai/"):
+        if "claude" in resolved_model:
+            try:
+                import anthropic  # noqa: F401
+                import vertexai  # noqa: F401
+            except ImportError as ie:
+                return (
+                    False,
+                    f"Missing dependency for Vertex AI partner model '{resolved_model}': {ie}. "
+                    f"Run 'pip install google-cloud-aiplatform anthropic' or re-run './install.sh'."
+                )
+
+    from core.config import (
+        is_rate_limit_error,
+        extract_retry_after,
+        extract_rate_limit_detail,
+        compute_full_jitter_delay,
+        is_auth_error,
+        format_auth_error_message,
+    )
+
+    call_kwargs = dict(kwargs)
+    call_kwargs["max_tokens"] = max_tokens
+    call_kwargs["timeout"] = timeout
+    call_kwargs["model"] = resolved_model
+
+    max_probe_attempts = 3
+    for attempt in range(max_probe_attempts):
+        try:
+            response = litellm.completion(
+                messages=[{"role": "user", "content": prompt}],
+                **call_kwargs,
+            )
+            if response and getattr(response, "choices", None) and len(response.choices) > 0:
+                return True, f"LLM reachability verified for '{resolved_model}'."
+            return True, f"LLM probe received response for '{resolved_model}'."
+        except Exception as e:
+            err_msg = str(e)
+            err_type = type(e).__name__
+            if is_auth_error(e):
+                return False, format_auth_error_message(e, model=resolved_model)
+            if "No module named 'vertexai'" in err_msg or "No module named 'anthropic'" in err_msg:
+                return (
+                    False,
+                    f"Missing dependency for Vertex AI partner models: {err_msg}. "
+                    f"Run 'pip install google-cloud-aiplatform anthropic' or re-run './install.sh'."
+                )
+            if is_rate_limit_error(e):
+                if attempt + 1 < max_probe_attempts:
+                    retry_after = extract_retry_after(e)
+                    delay = compute_full_jitter_delay(
+                        attempt=attempt,
+                        initial_delay=5.0,
+                        max_delay=30.0,
+                        min_offset=5.0,
+                        retry_after=retry_after,
+                    )
+                    time.sleep(delay)
+                    continue
+                detail = extract_rate_limit_detail(e)
+                return (
+                    True,
+                    f"LLM reachability verified for '{resolved_model}' (Endpoint & credentials verified; currently rate-limited: {detail}).",
+                )
+            return False, f"LLM reachability probe failed ({err_type}): {err_msg}"
+
+    return False, f"LLM reachability probe failed after {max_probe_attempts} attempts."
+
+
+def _check_llm_preflight(config: dict, probe: bool = False) -> Tuple[bool, str]:
+    """Fast validation of LLM configuration and credentials in ~1s.
+    
+    If probe is True (or MANTIS_PROBE_LLM=1), actively tests model reachability
+    and client dependencies by sending a test prompt with max_tokens=256.
+    """
     model = config.get("default_model", DEFAULT_MODEL)
     api_base = config.get("api_base")
     timeout = config.get("timeout")
@@ -414,33 +614,46 @@ def _check_llm_preflight(config: dict) -> Tuple[bool, str]:
             if not api_base:
                 return False, "Vertex AI OpenAI model requires a valid GCP Project ID or --api-base endpoint."
         endpoint_info = f" @ {api_base}" if api_base else ""
-        return True, f"Vertex AI OpenAI LLM configured (Model: {resolved_model}{endpoint_info})."
+        static_msg = f"Vertex AI OpenAI LLM configured (Model: {resolved_model}{endpoint_info})."
 
-    if resolved_model.startswith("vertex_ai/"):
+    elif resolved_model.startswith("vertex_ai/"):
         proj = kwargs.get("vertex_project")
         if not proj or is_placeholder(proj):
             return False, "Vertex AI requires a valid GCP Project ID."
-        return True, f"Vertex AI LLM configured (Model: {resolved_model}, Project: {proj})."
+        static_msg = f"Vertex AI LLM configured (Model: {resolved_model}, Project: {proj})."
 
-    if resolved_model.startswith("anthropic/"):
+    elif resolved_model.startswith("anthropic/"):
         if not os.environ.get("ANTHROPIC_API_KEY"):
             return False, "Anthropic model requires ANTHROPIC_API_KEY environment variable."
-        return True, f"Anthropic LLM configured (Model: {resolved_model})."
+        static_msg = f"Anthropic LLM configured (Model: {resolved_model})."
 
-    if resolved_model.startswith("openai/") or api_base:
+    elif resolved_model.startswith("openai/") or api_base:
         if not os.environ.get("OPENAI_API_KEY") and not api_base:
             return False, "OpenAI model requires OPENAI_API_KEY or --api-base endpoint."
         endpoint_info = f" @ {api_base}" if api_base else ""
-        return True, f"OpenAI-compatible LLM configured (Model: {resolved_model}{endpoint_info})."
+        static_msg = f"OpenAI-compatible LLM configured (Model: {resolved_model}{endpoint_info})."
 
-    if resolved_model.startswith("gemini-"):
+    elif resolved_model.startswith("gemini-"):
         if not os.environ.get("GEMINI_API_KEY") and not os.environ.get("GOOGLE_API_KEY"):
             # Check if vertex credentials are available
             if not os.environ.get("GOOGLE_CLOUD_PROJECT") and not os.environ.get("VERTEXAI_PROJECT") and not kwargs.get("vertex_project"):
                 return False, "Gemini model requires GEMINI_API_KEY or GCP Project ID for Vertex AI."
-        return True, f"Gemini LLM configured (Model: {resolved_model})."
+        static_msg = f"Gemini LLM configured (Model: {resolved_model})."
 
-    return True, f"LLM configured (Model: {resolved_model})."
+    else:
+        static_msg = f"LLM configured (Model: {resolved_model})."
+
+    should_probe = probe or os.environ.get("MANTIS_PROBE_LLM") in ("1", "true", "True")
+    if should_probe:
+        probe_timeout = timeout if timeout is not None else 15.0
+        probe_ok, probe_msg = _probe_llm_reachability(
+            resolved_model, kwargs, prompt="test", max_tokens=256, timeout=probe_timeout
+        )
+        if not probe_ok:
+            return False, probe_msg
+        return True, f"{static_msg} [Live probe: OK]"
+
+    return True, static_msg
 
 
 async def run_preflight_checks_async(
@@ -448,13 +661,14 @@ async def run_preflight_checks_async(
     test_llm: bool = True,
     test_sandbox: bool = True,
     target_path: str = "",
+    probe_llm: bool = False,
 ) -> Tuple[bool, List[str]]:
     """Runs combined LLM and Sandbox preflight testing asynchronously in ~1-2s."""
     messages = []
     all_ok = True
 
     if test_llm:
-        ok, msg = _check_llm_preflight(config)
+        ok, msg = _check_llm_preflight(config, probe=probe_llm)
         messages.append(f"[LLM PREFLIGHT] {'✅ PASSED' if ok else '❌ FAILED'}: {msg}")
         if not ok:
             all_ok = False
@@ -474,6 +688,7 @@ def run_preflight_checks(
     test_llm: bool = True,
     test_sandbox: bool = True,
     target_path: str = "",
+    probe_llm: bool = False,
 ) -> Tuple[bool, List[str]]:
     """Runs combined LLM and Sandbox preflight testing safely in sync contexts."""
     try:
@@ -491,6 +706,7 @@ def run_preflight_checks(
                     test_llm=test_llm,
                     test_sandbox=test_sandbox,
                     target_path=target_path,
+                    probe_llm=probe_llm,
                 ),
             ).result()
     else:
@@ -500,6 +716,7 @@ def run_preflight_checks(
                 test_llm=test_llm,
                 test_sandbox=test_sandbox,
                 target_path=target_path,
+                probe_llm=probe_llm,
             )
         )
 
@@ -530,6 +747,8 @@ def update_workflow_config(
         cfg["reasoning_effort"] = updates["reasoning_effort"]
     if "db_path" in updates:
         cfg["db_path"] = updates["db_path"]
+    if "project" in updates:
+        cfg["project"] = updates["project"]
 
     if "sandbox" in updates:
         sb_update = updates["sandbox"]
@@ -598,6 +817,67 @@ def _refuse_silent_downgrade(reason: str) -> None:
     raise SystemExit(2)
 
 
+def _sandbox_choice_is_explicit(workflow_path: str) -> bool:
+    """True when the operator explicitly chose a sandbox tier.
+
+    An explicit choice is a 'sandbox' key in the local overlay
+    (workflow.local.json -- written by the wizard, --sandbox, or a previous
+    auto-promotion) or a non-static sandbox committed in the base
+    workflow.json. The tracked base file keeps a 'static-only' floor by
+    design, so a bare static-only there is a default, not a decision.
+    """
+    try:
+        if os.path.exists(workflow_path):
+            with open(workflow_path, "r", encoding="utf-8") as f:
+                base = json.load(f)
+            if isinstance(base, dict):
+                base_sb = (base.get("config", {}) or {}).get("sandbox", {})
+                if isinstance(base_sb, dict) and base_sb.get("type") not in (
+                    None,
+                    "",
+                    "static-only",
+                    "static",
+                ):
+                    return True
+    except Exception:
+        pass
+
+    base_dir = os.path.dirname(os.path.abspath(workflow_path))
+    base_name = os.path.basename(workflow_path)
+    stem = base_name[:-5] if base_name.endswith(".json") else base_name
+    for cand in (
+        os.path.join(base_dir, f"{stem}.local.json"),
+        os.path.join(base_dir, f".{stem}.local.json"),
+    ):
+        if not os.path.exists(cand):
+            continue
+        try:
+            with open(cand, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            # Unreadable overlay: treat as explicit so we never overwrite it.
+            return True
+        if isinstance(data, dict) and (
+            "sandbox" in data or "sandbox" in (data.get("config", {}) or {})
+        ):
+            return True
+    return False
+
+
+def _print_static_floor_hint(caps: dict) -> None:
+    """One-line, every-launch hint that dynamic reproduction is disabled."""
+    if "microsandbox" in caps.get("available_sandboxes", []):
+        print(
+            "⚠️  Sandbox is 'static-only': this host supports microsandbox but no guest "
+            "image is cached. Run ./install.sh to enable dynamic exploit reproduction."
+        )
+    else:
+        print(
+            "⚠️  Sandbox is 'static-only' (no supported isolation tier detected on this host). "
+            "Dynamic exploit reproduction is DISABLED."
+        )
+
+
 async def ensure_configured_async(
     workflow_path: str = "",
     auto: bool = True,
@@ -605,6 +885,8 @@ async def ensure_configured_async(
     overrides: Optional[dict] = None,
     save: bool = True,
     save_tracked: bool = False,
+    probe_llm: bool = False,
+    persist_overrides: bool = False,
 ) -> dict:
     """Ensures workflow configuration is valid asynchronously. Auto-resolves defaults or prompts if needed."""
     target_wf = find_workflow_json(workflow_path)
@@ -625,9 +907,28 @@ async def ensure_configured_async(
     sb_opts = dict(cfg.get("sandbox", {}).get("options", {}))
     sb_available = sb_type in caps.get("available_sandboxes", ["static-only"])
 
-    if not is_unconf and not overrides and sb_available:
-        ok, _ = await run_preflight_checks_async(cfg)
+    # Auto-promotion: a 'static-only' floor inherited from the tracked
+    # workflow.json is a default, not an operator decision. When this host can
+    # actually run microsandbox (virtualization + cached guest image verified),
+    # promote to it and persist, instead of silently skipping dynamic
+    # reproduction forever. An explicit operator choice (any sandbox key in
+    # workflow.local.json, a non-static tracked type, or a --sandbox override
+    # this invocation) is never second-guessed.
+    promote_to_microsandbox = (
+        auto
+        and not interactive
+        and sb_type in ("static-only", "static")
+        and "sandbox" not in overrides
+        and caps.get("recommended_sandbox") == "microsandbox"
+        and bool(caps.get("microsandbox_image"))
+        and not _sandbox_choice_is_explicit(target_wf)
+    )
+
+    if not is_unconf and not overrides and sb_available and not promote_to_microsandbox:
+        ok, _ = await run_preflight_checks_async(cfg, probe_llm=probe_llm)
         if ok:
+            if sb_type in ("static-only", "static"):
+                _print_static_floor_hint(caps)
             return cfg
 
     updates: dict[str, Any] = {}
@@ -636,6 +937,23 @@ async def ensure_configured_async(
         return run_interactive_wizard(target_wf)
 
     if auto:
+        if promote_to_microsandbox:
+            msb_image = caps["microsandbox_image"]
+            updates["sandbox"] = {
+                "type": "microsandbox",
+                "options": {"image": msb_image},
+            }
+            sb_type = "microsandbox"
+            sb_opts = {"image": msb_image}
+            cfg = {**cfg, "sandbox": {"type": "microsandbox", "options": dict(sb_opts)}}
+            print(
+                f"🔒 Auto-configured sandbox: 'microsandbox' (networkless hardware microVM, "
+                f"guest image '{msb_image}'). Persisting to workflow.local.json; "
+                f"override with --sandbox or configure.py."
+            )
+        elif sb_type in ("static-only", "static") and "sandbox" not in overrides:
+            _print_static_floor_hint(caps)
+
         # Auto-resolve GCE project if unconfigured
         if sb_type == "gce":
             cur_proj = sb_opts.get("project", "")
@@ -687,8 +1005,13 @@ async def ensure_configured_async(
                     os.environ.setdefault("VERTEXAI_PROJECT", resolved_proj)
                     os.environ.setdefault("GOOGLE_CLOUD_PROJECT", resolved_proj)
 
+        # One-shot CLI overrides are already live for THIS run (applied above
+        # with save=False, and re-applied by main.py via
+        # load_workflow_from_json(*_override)). A per-invocation flag must
+        # never become sticky configuration unless the operator explicitly
+        # opts in with --save-config; auto-resolution results always persist.
         if updates or overrides:
-            all_updates = {**updates, **overrides}
+            all_updates = {**updates, **overrides} if persist_overrides else dict(updates)
             # Safety net: never allow a downgraded sandbox type to be persisted to disk
             if all_updates.get("sandbox", {}).get("type") == "static-only" and sb_type not in ("", "static-only"):
                 del all_updates["sandbox"]
@@ -711,6 +1034,8 @@ def ensure_configured(
     overrides: Optional[dict] = None,
     save: bool = True,
     save_tracked: bool = False,
+    probe_llm: bool = False,
+    persist_overrides: bool = False,
 ) -> dict:
     """Ensures workflow configuration is valid. Auto-resolves defaults or prompts if needed."""
     try:
@@ -730,6 +1055,8 @@ def ensure_configured(
                     overrides=overrides,
                     save=save,
                     save_tracked=save_tracked,
+                    probe_llm=probe_llm,
+                    persist_overrides=persist_overrides,
                 ),
             ).result()
     else:
@@ -741,6 +1068,8 @@ def ensure_configured(
                 overrides=overrides,
                 save=save,
                 save_tracked=save_tracked,
+                probe_llm=probe_llm,
+                persist_overrides=persist_overrides,
             )
         )
 
@@ -756,7 +1085,7 @@ def run_interactive_wizard(workflow_path: str) -> dict:
     cfg = wf_data.get("config", {})
 
     print("Detected Host Capabilities:")
-    print(f"  • KVM Virtualization: {'✅ Available' if caps['kvm'] else '❌ Not found'}")
+    print(f"  • MicroVM Support:    {'✅ Available' if 'microsandbox' in caps['available_sandboxes'] else '❌ Not found'} (guest image: {caps.get('microsandbox_image') or '❌ none cached'})")
     print(f"  • Container Engine:   {caps['container_tool'] or '❌ None'} (runsc: {'✅ Yes' if caps['runsc'] else '❌ No'})")
     print(f"  • Google Cloud SDK:   {'✅ Active (' + str(caps['gcp_account']) + ')' if caps['gcp_auth'] else '❌ No active auth'}")
     print(f"  • GCP Project:        {caps['gcp_project'] or '❌ Not set'}")
@@ -767,7 +1096,7 @@ def run_interactive_wizard(workflow_path: str) -> dict:
     sb_choices = [
         ("static-only", "Static Analysis only (Fastest, zero isolation requirement)"),
         ("gvisor", "gVisor Container Sandbox (Networkless OCI container with runsc)"),
-        ("microsandbox", "Microsandbox VM (Hardware-accelerated KVM microVM)"),
+        ("microsandbox", "Microsandbox VM (Hardware microVM: KVM on Linux, Hypervisor.framework on macOS)"),
         ("gce", "Google Compute Engine Sandbox (Hardened ephemeral cloud VM)"),
     ]
     for i, (k, desc) in enumerate(sb_choices, 1):
@@ -864,7 +1193,12 @@ def run_interactive_wizard(workflow_path: str) -> dict:
     return preview_wf.get("config", {})
 
 
-def print_status(workflow_path: str, as_json: bool = False, config_override: Optional[dict] = None) -> None:
+def print_status(
+    workflow_path: str,
+    as_json: bool = False,
+    config_override: Optional[dict] = None,
+    probe_llm: bool = False,
+) -> None:
     """Prints current configuration and preflight test status."""
     target_wf = find_workflow_json(workflow_path)
     if config_override is not None:
@@ -873,7 +1207,7 @@ def print_status(workflow_path: str, as_json: bool = False, config_override: Opt
         wf_data = load_workflow_dict(target_wf, load_local=True)
         cfg = wf_data.get("config", {})
     caps = detect_capabilities()
-    ok, messages = run_preflight_checks(cfg)
+    ok, messages = run_preflight_checks(cfg, probe_llm=probe_llm)
     is_unconf, issues = is_default_or_unconfigured(cfg)
 
     local_path = get_local_workflow_path(target_wf)
@@ -968,6 +1302,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Save configuration changes directly to base tracked workflow.json instead of workflow.local.json overlay",
     )
     parser.add_argument("--test", "--preflight", action="store_true", help="Run fast preflight validation tests (~1-2s)")
+    parser.add_argument(
+        "--probe",
+        "--probe-llm",
+        action="store_true",
+        dest="probe_llm",
+        help="Perform an active live reachability probe against the configured LLM endpoint",
+    )
     parser.add_argument("--check-clean", action="store_true", help="Verify base workflow.json uses default unconfigured placeholders (for pre-commit)")
     parser.add_argument("--show", action="store_true", help="Display current configuration status")
     parser.add_argument("--dry-run", action="store_true", help="Show changes without writing to workflow.json or workflow.local.json")
@@ -1009,7 +1350,7 @@ def main() -> int:
 
     # 2. Status Only Mode
     if args.show:
-        print_status(target_wf, as_json=args.json)
+        print_status(target_wf, as_json=args.json, probe_llm=args.probe_llm)
         return 0
 
     # Collect CLI overrides
@@ -1024,6 +1365,8 @@ def main() -> int:
         updates["reasoning_effort"] = args.reasoning_effort
     if args.db:
         updates["db_path"] = args.db
+    if args.project:
+        updates["project"] = args.project
 
     # Sandbox updates
     if args.sandbox:
@@ -1061,12 +1404,13 @@ def main() -> int:
             overrides=updates,
             save=save,
             save_tracked=save_tracked,
+            probe_llm=args.probe_llm,
         )
         if not args.json:
             action = "Simulated auto-configuration for" if args.dry_run else "Auto-configured Mantis settings saved to"
             dest = target_wf if save_tracked else get_local_workflow_path(target_wf)
             print(f"✅ {action} {dest}")
-        print_status(target_wf, as_json=args.json, config_override=cfg if args.dry_run else None)
+        print_status(target_wf, as_json=args.json, config_override=cfg if args.dry_run else None, probe_llm=args.probe_llm)
         return 0
 
     # 4. CLI Updates Mode or Explicit --save
@@ -1082,29 +1426,29 @@ def main() -> int:
             action = "Simulated update for" if args.dry_run else "Saved updates to"
             dest = target_wf if save_tracked else get_local_workflow_path(target_wf)
             print(f"✅ {action} {dest}")
-        if args.test:
-            ok, msgs = run_preflight_checks(updated_data.get("config", {}))
+        if args.test or args.probe_llm:
+            ok, msgs = run_preflight_checks(updated_data.get("config", {}), probe_llm=args.probe_llm)
             if args.json:
                 print(json.dumps({"preflight_passed": ok, "messages": msgs}, indent=2))
             else:
                 for m in msgs:
                     print(m)
             return 0 if ok else 1
-        print_status(target_wf, as_json=args.json, config_override=updated_data.get("config") if args.dry_run else None)
+        print_status(target_wf, as_json=args.json, config_override=updated_data.get("config") if args.dry_run else None, probe_llm=args.probe_llm)
         return 0
 
     # 5. Preflight Test Only
-    if args.test:
+    if args.test or args.probe_llm:
         wf_data = load_workflow_dict(target_wf, load_local=True)
-        ok, msgs = run_preflight_checks(wf_data.get("config", {}))
+        ok, msgs = run_preflight_checks(wf_data.get("config", {}), probe_llm=args.probe_llm)
         if args.json:
             print(json.dumps({"preflight_passed": ok, "messages": msgs}, indent=2))
         else:
-            print_status(target_wf)
+            print_status(target_wf, probe_llm=args.probe_llm)
         return 0 if ok else 1
 
     # Default action: show status
-    print_status(target_wf, as_json=args.json)
+    print_status(target_wf, as_json=args.json, probe_llm=args.probe_llm)
     return 0
 
 

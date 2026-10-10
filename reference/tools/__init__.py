@@ -18,13 +18,29 @@ from .research_tools import (
     calibrate_finding,
     get_security_guidance,
     query_lineage,
+    get_git_log,
+    get_git_diff,
+    detect_vcs_info,
 )
-from .sandbox_tools import run_sandbox, apply_patch
+from .sandbox_tools import (
+    run_sandbox,
+    apply_patch,
+    run_sandbox_with_evidence,
+    check_reached_sink_evidence,
+)
+from .structural_tools import (
+    find_symbol,
+    find_callers,
+    find_callees,
+    get_function_boundary,
+)
 
 TOOLS: dict[str, object] = {
     "read_file": read_file,
     "write_file": write_file,
     "list_files": list_files,
+    "get_git_log": get_git_log,
+    "get_git_diff": get_git_diff,
     "report_findings": report_findings,
     "get_findings": get_findings,
     "score_risk": score_risk,
@@ -41,6 +57,11 @@ TOOLS: dict[str, object] = {
     "generate_report": generate_report,
     "run_sandbox": run_sandbox,
     "apply_patch": apply_patch,
+    "run_sandbox_with_evidence": run_sandbox_with_evidence,
     "get_security_guidance": get_security_guidance,
     "query_lineage": query_lineage,
+    "find_symbol": find_symbol,
+    "find_callers": find_callers,
+    "find_callees": find_callees,
+    "get_function_boundary": get_function_boundary,
 }
