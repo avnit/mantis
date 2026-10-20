@@ -32,12 +32,19 @@ from core.config import (
     is_auth_error,
     format_auth_error_message,
 )
-from core.graph_loader import ClassifierNode, EdgeSpec, GlobalConfig, SandboxConfig, WorkflowSpec
+from core.graph_loader import (
+    NODE_STAMP_STATUSES,
+    ClassifierNode,
+    EdgeSpec,
+    GlobalConfig,
+    SandboxConfig,
+    WorkflowSpec,
+)
 from tools import TOOLS
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SYNTHESIZER_MODEL = "vertex_ai/gemini-3.7-flash"
+DEFAULT_SYNTHESIZER_MODEL = "vertex_ai/gemini-3.8-flash"
 VALID_TOOLS: Set[str] = set(TOOLS.keys())
 
 KNOWN_SKILLS: Set[str] = {
@@ -87,7 +94,7 @@ A valid workflow JSON has the following top-level structure:
   "name": "workflow_<domain_slug>",
   "config": {
     "db_path": "knowledge.db",
-    "default_model": "vertex_ai/gemini-3.7-flash",
+    "default_model": "vertex_ai/gemini-3.8-flash",
     "sandbox": {"type": "static-only | gvisor | microsandbox | gce"}
   },
   "nodes": [ ... ],
@@ -495,28 +502,31 @@ class ResearchGraphSynthesizer:
         target_root: str = ".",
         sandbox_type: Optional[str] = None,
         astm: Optional[dict] = None,
+        parallel_researchers: bool = False,
     ) -> WorkflowSpec:
         """Synthesizes a complete, runnable WorkflowSpec tailored to the detected archetype.
 
         `astm` is the Surveyor's map of the target. It supplies the archetype when the
         objective names no domain, and it never expands sandbox capability (section 5.4).
+        When `parallel_researchers` is True, emits two complementary parallel researcher
+        arms (`researcher_structural` and `researcher_domain`) converging at `dedupe`.
         """
         domain_slug = slugify(objective)
         archetype, archetype_source = self.detect_domain_archetype_with_provenance(objective, astm)
         cfg_archetype = DOMAIN_ARCHETYPES.get(archetype, {})
 
-        researcher_tools = cfg_archetype.get(
+        researcher_tools = list(cfg_archetype.get(
             "researcher_tools",
             ["read_file", "list_files", "report_findings", "get_findings", "get_threat_model", "record_threat_model"],
-        )
-        reproducer_tools = cfg_archetype.get(
+        ))
+        reproducer_tools = list(cfg_archetype.get(
             "reproducer_tools",
             ["run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings"],
-        )
-        patcher_tools = cfg_archetype.get(
+        ))
+        patcher_tools = list(cfg_archetype.get(
             "patcher_tools",
             ["apply_patch", "run_sandbox", "run_sandbox_with_evidence", "read_file", "write_file", "get_findings", "get_security_guidance", "query_lineage"],
-        )
+        ))
         # Sandbox selection, per section 5.4. An explicit operator choice is honoured
         # unchanged. Otherwise the archetype's preferred backend is a REQUEST, and what
         # it is clamped against depends on where the archetype came from:
@@ -559,6 +569,61 @@ class ResearchGraphSynthesizer:
 
         budget_dict = dataclasses.asdict(budget_config) if budget_config else dataclasses.asdict(BudgetConfig())
 
+        if parallel_researchers:
+            from core.prompts import get_stage_prompt
+
+            base_researcher_prompt = get_stage_prompt("researcher", "mantis-researcher")
+            structural_nav = ["find_symbol", "find_callers", "find_callees", "get_function_boundary"]
+            struct_tools = list(dict.fromkeys(researcher_tools + [t for t in structural_nav if t in VALID_TOOLS]))
+            domain_tools = list(dict.fromkeys(
+                researcher_tools + (["get_security_guidance"] if "get_security_guidance" in VALID_TOOLS else [])
+            ))
+            researcher_nodes: List[Dict[str, Any]] = [
+                {
+                    "id": "researcher_structural",
+                    "type": "agent",
+                    "skill": "mantis-researcher",
+                    "system_prompt": (
+                        f"{base_researcher_prompt}\n\n"
+                        "You are the Structural Call-Graph Researcher arm. Use find_symbol, "
+                        "find_callers, find_callees, and get_function_boundary to trace "
+                        "cross-file source-to-sink data flows and report verified findings via report_findings."
+                    ),
+                    "tools": struct_tools,
+                },
+                {
+                    "id": "researcher_domain",
+                    "type": "agent",
+                    "skill": "mantis-researcher",
+                    "system_prompt": (
+                        f"{base_researcher_prompt}\n\n"
+                        f"You are the Domain & Business-Logic Researcher arm for {archetype} ({objective}). "
+                        "Audit authentication/authorization invariants, state transitions, and trust boundary "
+                        "violations, and report verified findings via report_findings."
+                    ),
+                    "tools": domain_tools,
+                },
+            ]
+            researcher_edges: List[Dict[str, Any]] = [
+                {"from": "threat_model", "to": "researcher_structural"},
+                {"from": "threat_model", "to": "researcher_domain"},
+                {"from": "researcher_structural", "to": "dedupe"},
+                {"from": "researcher_domain", "to": "dedupe"},
+            ]
+        else:
+            researcher_nodes = [
+                {
+                    "id": "researcher",
+                    "type": "agent",
+                    "skill": "mantis-researcher",
+                    "tools": researcher_tools,
+                },
+            ]
+            researcher_edges = [
+                {"from": "threat_model", "to": "researcher"},
+                {"from": "researcher", "to": "dedupe"},
+            ]
+
         # Build declarative nodes
         nodes: List[Dict[str, Any]] = [
             {
@@ -567,12 +632,7 @@ class ResearchGraphSynthesizer:
                 "skill": "mantis-threat-model",
                 "tools": ["read_file", "list_files", "record_threat_model", "get_threat_model"],
             },
-            {
-                "id": "researcher",
-                "type": "agent",
-                "skill": "mantis-researcher",
-                "tools": researcher_tools,
-            },
+            *researcher_nodes,
             {
                 "id": "dedupe",
                 "type": "agent",
@@ -646,8 +706,7 @@ class ResearchGraphSynthesizer:
         # Connect the edges
         edges: List[Dict[str, Any]] = [
             {"from": "START", "to": "threat_model"},
-            {"from": "threat_model", "to": "researcher"},
-            {"from": "researcher", "to": "dedupe"},
+            *researcher_edges,
             {"from": "dedupe", "to": "reviewer"},
             {"from": "reviewer", "to": "critic"},
             {"from": "critic", "to": "review_decision"},
@@ -915,7 +974,7 @@ class ResearchGraphSynthesizer:
                     output_key = output_key or "verdict"
 
                 on_enter_status = n.get("on_enter_status")
-                if on_enter_status and on_enter_status not in VALID_STATUSES:
+                if on_enter_status and on_enter_status not in NODE_STAMP_STATUSES:
                     on_enter_status = None
                 if ("repro" in clean_id or (skill and "reproduce" in skill)) and not on_enter_status:
                     on_enter_status = "static_confirmed"
@@ -1224,6 +1283,7 @@ class ResearchGraphSynthesizer:
         model: Optional[str] = None,
         timeout: Optional[float] = None,
         astm: Optional[dict] = None,
+        parallel_researchers: bool = False,
     ) -> WorkflowSpec:
         """Synthesizes a complete, runnable WorkflowSpec tailored to the given objective."""
         if use_llm:
@@ -1242,7 +1302,144 @@ class ResearchGraphSynthesizer:
             target_root=target_root,
             sandbox_type=sandbox_type,
             astm=astm,
+            parallel_researchers=parallel_researchers,
         )
+
+    def propose_probe_compose(
+        self,
+        objective: str,
+        budget_config: Optional[BudgetConfig] = None,
+        target_root: str = ".",
+        sandbox_type: Optional[str] = None,
+        astm: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        """Harness²-style Propose–Probe–Compose (INV + DOM -> COMP) workflow synthesis.
+
+        Generates two orthogonal candidate modifications over the baseline workflow:
+          1. `inv` (Operational/Investigation proposer): enriches researcher,
+             reviewer, and patcher stages with structural call-graph navigation
+             tools (`find_symbol`, `find_callers`, `find_callees`,
+             `get_function_boundary`) and reachability verification instructions.
+          2. `dom` (Domain/Topology proposer): introduces parallel complementary
+             researcher arms (`researcher_structural` + `researcher_domain`) and
+             domain-tailored threat-model instructions.
+        Validates both candidates through `sanitize_and_validate_spec`, computes
+        pre-rollout `harness_diversity`, and composes (`composed`) the operational
+        and domain improvements into a unified, compiler-verified `WorkflowSpec`.
+        """
+        from core.diversity import harness_diversity
+        from core.prompts import get_stage_prompt
+
+        base_spec = self.synthesize_archetype(
+            objective=objective,
+            budget_config=budget_config,
+            target_root=target_root,
+            sandbox_type=sandbox_type,
+            astm=astm,
+            parallel_researchers=False,
+        )
+
+        structural_nav = [
+            t
+            for t in ("find_symbol", "find_callers", "find_callees", "get_function_boundary")
+            if t in VALID_TOOLS
+        ]
+
+        # 1. Operational proposer (INV): structural navigation & call-graph verification
+        inv_raw = base_spec.model_dump(by_alias=True, exclude_none=True)
+        inv_raw["name"] = f"{base_spec.name}_inv"
+        for node in inv_raw.get("nodes", []):
+            nid = node.get("id", "")
+            if nid in ("researcher", "reviewer", "critic", "patcher"):
+                existing_tools = list(node.get("tools") or [])
+                node["tools"] = list(dict.fromkeys(existing_tools + structural_nav))
+            if nid == "researcher":
+                base_prompt = get_stage_prompt(nid, str(node.get("skill") or ""))
+                node["system_prompt"] = (
+                    f"{base_prompt}\n\n"
+                    "Operational Investigation Focus: Use find_symbol, find_callers, "
+                    "find_callees, and get_function_boundary to verify cross-file "
+                    "source-to-sink reachability before calling report_findings."
+                )
+            elif nid == "reviewer":
+                base_prompt = get_stage_prompt(nid, str(node.get("skill") or ""))
+                node["system_prompt"] = (
+                    f"{base_prompt}\n\n"
+                    "Operational Review Focus: Re-read enclosing functions with "
+                    "get_function_boundary and verify caller reachability with "
+                    "find_callers before emitting a ReviewVerdict."
+                )
+        inv_spec = self.sanitize_and_validate_spec(
+            raw_dict=inv_raw,
+            objective=objective,
+            budget_config=budget_config,
+            target_root=target_root,
+            sandbox_type=sandbox_type,
+        )
+
+        # 2. Domain/Topology proposer (DOM): parallel researcher arms + domain threat model
+        dom_spec = self.synthesize_archetype(
+            objective=objective,
+            budget_config=budget_config,
+            target_root=target_root,
+            sandbox_type=sandbox_type,
+            astm=astm,
+            parallel_researchers=True,
+        )
+        dom_raw = dom_spec.model_dump(by_alias=True, exclude_none=True)
+        dom_raw["name"] = f"{base_spec.name}_dom"
+        for node in dom_raw.get("nodes", []):
+            if node.get("id") == "threat_model":
+                base_prompt = get_stage_prompt("threat_model", str(node.get("skill") or ""))
+                node["system_prompt"] = (
+                    f"{base_prompt}\n\n"
+                    f"Domain Threat Model Focus ({objective}): Enumerate trust boundaries, "
+                    "untrusted entrypoints, and privilege transitions before parallel "
+                    "researcher dispatch."
+                )
+        dom_spec = self.sanitize_and_validate_spec(
+            raw_dict=dom_raw,
+            objective=objective,
+            budget_config=budget_config,
+            target_root=target_root,
+            sandbox_type=sandbox_type,
+        )
+
+        # 3. Compose (COMP): merge DOM's parallel topology with INV's reviewer/critic/patcher tools
+        comp_raw = dom_spec.model_dump(by_alias=True, exclude_none=True)
+        comp_raw["name"] = f"{base_spec.name}_composed"
+        for node in comp_raw.get("nodes", []):
+            nid = node.get("id", "")
+            if nid in ("reviewer", "critic", "patcher"):
+                existing_tools = list(node.get("tools") or [])
+                node["tools"] = list(dict.fromkeys(existing_tools + structural_nav))
+            if nid == "reviewer":
+                base_prompt = get_stage_prompt(nid, str(node.get("skill") or ""))
+                node["system_prompt"] = (
+                    f"{base_prompt}\n\n"
+                    "Operational Review Focus: Re-read enclosing functions with "
+                    "get_function_boundary and verify caller reachability with "
+                    "find_callers before emitting a ReviewVerdict."
+                )
+        comp_spec = self.sanitize_and_validate_spec(
+            raw_dict=comp_raw,
+            objective=objective,
+            budget_config=budget_config,
+            target_root=target_root,
+            sandbox_type=sandbox_type,
+        )
+
+        div_metrics = harness_diversity(
+            {"inv": inv_spec, "dom": dom_spec, "composed": comp_spec},
+            baseline=base_spec,
+        )
+        return {
+            "baseline": base_spec,
+            "inv": inv_spec,
+            "dom": dom_spec,
+            "composed": comp_spec,
+            "diversity": div_metrics,
+        }
 
     @staticmethod
     def persist_recipe(
@@ -1266,6 +1463,220 @@ class ResearchGraphSynthesizer:
         recipe_path.write_text(json_str, encoding="utf-8")
 
         return recipe_path
+
+    def evolve_iteration(
+        self,
+        objective: str,
+        workspace_root: Path | str,
+        *,
+        budget_config: Optional[BudgetConfig] = None,
+        target_root: str = ".",
+        sandbox_type: Optional[str] = None,
+        astm: Optional[dict] = None,
+        db_path: Optional[str] = None,
+        run_id: str = "meta-evolve",
+        baseline_rollout: Any = None,
+        baseline_deliverable: Any = None,
+        probe_runner: Optional[Any] = None,
+        selector_fn: Optional[Any] = None,
+        reflector_fn: Optional[Any] = None,
+        seed: str = "mantis-blind-select",
+    ) -> Dict[str, Any]:
+        """Executes one complete Harness² Propose–Probe–Select–Reflect iteration.
+
+        1. Materializes an on-disk `ContextTree` (via `export_to_context_tree` and
+           `build_context_tree`) and builds the proposer prompt via `mission`.
+        2. Synthesizes `baseline`, `inv`, `dom`, and `composed` candidates via
+           `propose_probe_compose` and checks `harness_diversity`.
+        3. Runs candidate probes (via `probe_runner` or structural summaries),
+           anonymizes summaries (`assign_blind_ids`, `format_blind_candidates`),
+           resolves the winning candidate (`resolve_blind_pick` with non-regression
+           fallback to `"baseline"`), and persists the winning recipe via
+           `persist_recipe`.
+        4. Materializes the multi-candidate `ContextTree`, runs counterfactual
+           causal reflection (`parse_reflection_blocks`), and persists `<edits>`
+           and stage-targeted `<experience>` lessons via `record_reflection_output`.
+        """
+        from core.diversity import (
+            assign_blind_ids,
+            format_blind_candidates,
+            resolve_blind_pick,
+        )
+        from core.harness_context import (
+            build_context_tree,
+            mission,
+            parse_reflection_blocks,
+        )
+        from core.knowledge import export_to_context_tree
+        from core.memory import record_reflection_output
+
+        work_root = Path(workspace_root)
+        tree_dir = work_root / "context"
+        active_db = db_path or self.db_path
+        task_slug = slugify(objective)
+
+        prior_decisions: List[str] = []
+        if active_db and os.path.exists(active_db):
+            exported = export_to_context_tree(
+                active_db,
+                tree_dir,
+                task_description=objective,
+                repo_root=target_root,
+                task_id=task_slug,
+            )
+            dec_dir = exported.root / "decisions"
+            if dec_dir.is_dir():
+                for dec_file in sorted(dec_dir.glob("*.md")):
+                    prior_decisions.append(dec_file.read_text(encoding="utf-8"))
+
+        ppc = self.propose_probe_compose(
+            objective=objective,
+            budget_config=budget_config,
+            target_root=target_root,
+            sandbox_type=sandbox_type,
+            astm=astm,
+        )
+        candidates: Dict[str, WorkflowSpec] = {
+            "baseline": ppc["baseline"],
+            "inv": ppc["inv"],
+            "dom": ppc["dom"],
+            "composed": ppc["composed"],
+        }
+        diversity = ppc["diversity"]
+
+        rollouts: Dict[str, Any] = {}
+        if baseline_rollout is not None:
+            rollouts["baseline"] = baseline_rollout
+        deliverables: Dict[str, Any] = {}
+        if baseline_deliverable is not None:
+            deliverables["baseline"] = baseline_deliverable
+        harness_files: Dict[str, str] = {
+            "baseline/workflow.json": json.dumps(
+                candidates["baseline"].model_dump(by_alias=True, exclude_none=True),
+                indent=2,
+                sort_keys=True,
+            )
+        }
+
+        proposer_tree = build_context_tree(
+            dest=tree_dir,
+            task_id=task_slug,
+            task_prompt=objective,
+            rollouts=rollouts,
+            deliverables=deliverables,
+            harness_files=harness_files,
+            decisions=prior_decisions,
+        )
+        proposer_mission = mission(
+            proposer_tree,
+            role="You are the Harness² Workflow Proposer.",
+            focus="Inspect context/rollouts/ and context/deliverables/ to diagnose bottlenecks.",
+            output="Return a compiler-valid WorkflowSpec JSON.",
+        )
+
+        summaries: Dict[str, Any] = {}
+        for label, spec in candidates.items():
+            harness_files[f"{label}/workflow.json"] = json.dumps(
+                spec.model_dump(by_alias=True, exclude_none=True),
+                indent=2,
+                sort_keys=True,
+            )
+            if callable(probe_runner):
+                probe_out = dict(probe_runner(label, spec) or {})
+                if probe_out.get("rollout") is not None:
+                    rollouts[label] = probe_out["rollout"]
+                if probe_out.get("deliverable") is not None:
+                    deliverables[label] = probe_out["deliverable"]
+                if probe_out.get("summary") is not None:
+                    summaries[label] = probe_out["summary"]
+                elif probe_out.get("deliverable") is not None:
+                    summaries[label] = probe_out["deliverable"]
+
+        blind_to_real, real_to_blind = assign_blind_ids(
+            list(candidates.keys()), seed=seed
+        )
+        blind_packet = (
+            format_blind_candidates(summaries, blind_to_real) if summaries else ""
+        )
+
+        if callable(probe_runner) and callable(selector_fn):
+            raw_pick = str(selector_fn(blind_packet, blind_to_real) or "")
+            try:
+                pick_resolution = resolve_blind_pick(
+                    raw_pick, blind_to_real, fallback_label="baseline"
+                )
+            except ValueError:
+                pick_resolution = {
+                    "blind_id": real_to_blind.get("baseline", ""),
+                    "selected": "baseline",
+                    "why": "Fallback to baseline on unparseable selector response.",
+                    "resolved_by": "fallback",
+                }
+        else:
+            pick_resolution = {
+                "blind_id": real_to_blind.get("baseline", ""),
+                "selected": "baseline",
+                "why": "No probe runner or blind selector supplied; retaining baseline.",
+                "resolved_by": "unprobed",
+            }
+        winning_label = pick_resolution["selected"]
+
+        winning_spec = candidates[winning_label]
+        recipe_path = self.persist_recipe(winning_spec, work_root)
+
+        reflection_tree = build_context_tree(
+            dest=tree_dir,
+            task_id=task_slug,
+            task_prompt=objective,
+            rollouts=rollouts,
+            deliverables=deliverables,
+            harness_files=harness_files,
+            decisions=prior_decisions,
+        )
+        reflection_mission = mission(
+            reflection_tree,
+            role="You are the Counterfactual Causal Reflector.",
+            focus=(
+                f"Compare winning candidate '{winning_label}' against baseline "
+                "and sibling arms in context/rollouts/ and context/deliverables/."
+            ),
+            output="Emit <edits> and <experience> blocks.",
+        )
+
+        reflection_text = ""
+        if callable(reflector_fn):
+            reflection_text = str(
+                reflector_fn(reflection_mission, reflection_tree) or ""
+            )
+
+        parsed_reflection = parse_reflection_blocks(reflection_text)
+        reflection_counts = {"edits": 0, "experiences": 0}
+        if (
+            callable(reflector_fn)
+            and reflection_text
+            and active_db
+            and os.path.exists(active_db)
+        ):
+            reflection_counts = record_reflection_output(
+                active_db, run_id, reflection_text
+            )
+
+        return {
+            "winning_label": winning_label,
+            "winning_spec": winning_spec,
+            "pick_resolution": pick_resolution,
+            "recipe_path": str(recipe_path),
+            "candidates": candidates,
+            "diversity": diversity,
+            "blind_mapping": blind_to_real,
+            "blind_packet": blind_packet,
+            "proposer_mission": proposer_mission,
+            "reflection_mission": reflection_mission,
+            "reflection": parsed_reflection,
+            "reflection_counts": reflection_counts,
+            "context_tree_root": str(reflection_tree.root),
+        }
+
 
 
 # Backwards compatibility alias

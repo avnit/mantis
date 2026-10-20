@@ -5,6 +5,7 @@ import os
 import uuid
 import hashlib
 import dataclasses
+import fnmatch
 import subprocess
 import warnings
 from pathlib import Path
@@ -32,15 +33,42 @@ from core.budget import (
 )
 from core.database import init_db, read_findings, read_risk_scores, update_status
 from core.sandbox import build_sandbox
-from core.graph_loader import load_workflow_from_json, DEFAULT_SEED_PROMPT
+from core.graph_loader import (
+    ABORT_GUARD_PROMPT,
+    DEFAULT_SEED_PROMPT,
+    count_event_tool_calls,
+    event_has_pseudo_tool_call,
+    load_workflow_from_json,
+    should_rearm_run,
+)
 from core.context import RunContext, current_run_context
 from core.paths import resolve_db_path
-from core.config import MantisAuthError, is_auth_error, format_auth_error_message, ResilientLiteLlm
+from core.config import EXIT_AUTH, MantisAuthError, is_auth_error, format_auth_error_message, ResilientLiteLlm
 from core.compactor import MantisEventsSummarizer
 from core.llm_gateway import strip_terminal_control
 
 APP_NAME = "mantis_graph"
 USER_ID = "user1"
+
+# Event error codes that mean the provider refused the credential. ADK sets
+# error_code to the exception's class name (litellm's AuthenticationError,
+# google-auth's RefreshError and friends, our own MantisAuthError) or to a
+# provider status. Matched exactly; the free-text error_message is never
+# consulted for this, because a model can write it.
+_AUTH_ERROR_CODES = frozenset({
+    "MantisAuthError",
+    "AuthenticationError",
+    "PermissionDeniedError",
+    "RefreshError",
+    "DefaultCredentialsError",
+    "ReauthError",
+    "ReauthFailError",
+    "ReauthSamlChallengeFailError",
+    "OAuthError",
+    "UserAccessTokenError",
+    "UNAUTHENTICATED",
+    "PERMISSION_DENIED",
+})
 
 
 def cprint(*args, **kwargs) -> None:
@@ -160,6 +188,8 @@ async def execute_sub_task(
     last_banner: tuple[str | None, str | None] = (None, None)
     current_active_node: str | None = None
     streamed_partial_text: bool = False
+    total_tool_calls: int = 0
+    saw_pseudo_tool_call: bool = False
 
     max_calls = 0
     if budget_controller and budget_controller.config.max_llm_calls > 0:
@@ -170,142 +200,182 @@ async def execute_sub_task(
     )
 
     try:
-        async for event in runner.run_async(
-            user_id=USER_ID,
-            session_id=session_id,
-            invocation_id=resumed_invocation_id,
-            new_message=new_message,
-            run_config=run_cfg,
-        ):
-            node_path = getattr(getattr(event, "node_info", None), "path", None)
-            route = getattr(getattr(event, "actions", None), "route", None)
+        pass_msg = new_message
+        pass_inv_id = resumed_invocation_id
+        for _rearm_pass in range(2):
+            async for event in runner.run_async(
+                user_id=USER_ID,
+                session_id=session_id,
+                invocation_id=pass_inv_id,
+                new_message=pass_msg,
+                run_config=run_cfg,
+            ):
+                total_tool_calls += count_event_tool_calls(event)
+                if event_has_pseudo_tool_call(event):
+                    saw_pseudo_tool_call = True
+                node_path = getattr(getattr(event, "node_info", None), "path", None)
+                route = getattr(getattr(event, "actions", None), "route", None)
 
-            if node_path:
-                node_name = node_path.split("/")[-1].split("@")[0]
-                if node_name != current_active_node:
-                    current_active_node = node_name
-                    streamed_partial_text = False
-                    ctx = current_run_context.get()
-                    if ctx:
-                        ctx.active_node = node_name
-                    if budget_controller:
-                        budget_controller.record_step(node_name)
+                if node_path:
+                    node_name = node_path.split("/")[-1].split("@")[0]
+                    if node_name != current_active_node:
+                        current_active_node = node_name
+                        streamed_partial_text = False
+                        ctx = current_run_context.get()
+                        if ctx:
+                            ctx.active_node = node_name
+                        if budget_controller:
+                            budget_controller.record_step(node_name)
+                        # Which nodes this process reached, in order, for the spend
+                        # report: a driver can tell "the researcher finished and the
+                        # run paused in review" from "the run paused before anyone
+                        # looked", which a bare exit code cannot.
+                        nodes = _SPEND_REPORT.setdefault("nodes", [])
+                        if node_name not in nodes:
+                            nodes.append(node_name)
 
-                if status_map and db_path and node_name in status_map and node_name not in stamped_nodes:
-                    stamped_nodes.add(node_name)
-                    new_status = status_map[node_name]
-                    ctx = current_run_context.get()
-                    if new_status in ("dynamic_confirmed", "patch_verified") and not (ctx and ctx.sandbox_executed):
-                        pass
-                    else:
-                        update_status(db_path, filepath, run_id, new_status)
+                    if status_map and db_path and node_name in status_map and node_name not in stamped_nodes:
+                        stamped_nodes.add(node_name)
+                        new_status = status_map[node_name]
+                        ctx = current_run_context.get()
+                        if new_status in ("dynamic_confirmed", "patch_verified") and not (ctx and ctx.sandbox_executed):
+                            pass
+                        else:
+                            update_status(db_path, filepath, run_id, new_status)
 
-            banner = (node_path, route)
-            if (node_path or route) and banner != last_banner:
-                if node_path and route:
-                    print(f"\n-- {node_path} -> {route}")
-                elif node_path:
-                    print(f"\n-- {node_path}")
-                elif route:
-                    print(f"\n-- {last_banner[0] or ''} -> {route}")
-                last_banner = banner
+                banner = (node_path, route)
+                if (node_path or route) and banner != last_banner:
+                    if node_path and route:
+                        print(f"\n-- {node_path} -> {route}")
+                    elif node_path:
+                        print(f"\n-- {node_path}")
+                    elif route:
+                        print(f"\n-- {last_banner[0] or ''} -> {route}")
+                    last_banner = banner
 
-            if getattr(event, "error_code", None):
-                node_key = node_path or "unknown"
-                errored.add(node_key)
-                err_msg = getattr(event, "error_message", None) or f"ADK Event error: {event.error_code}"
-                if event.error_code == "MantisAuthError" or is_auth_error(err_msg):
-                    raise MantisAuthError(err_msg)
-                if event.error_code in ("BudgetExceededError", "LlmCallsLimitExceededError"):
-                    limit_val = budget_controller.config.max_llm_calls if budget_controller else 500
-                    raise BudgetExceededError(
-                        trigger="llm_calls_limit" if event.error_code == "LlmCallsLimitExceededError" else "budget_exceeded",
-                        current_value="limit exceeded",
-                        limit_value=limit_val,
-                        run_id=run_id,
-                        details=str(err_msg),
-                    )
-                print(f"\n[EVENT ERROR {event.error_code}] {err_msg}", file=sys.stderr)
-            else:
-                usage = getattr(event, "usage_metadata", None)
-                if budget_controller and usage and getattr(usage, "total_token_count", None):
-                    total_tokens = int(usage.total_token_count)
-                    cached_tokens = int(getattr(usage, "cached_content_token_count", 0) or 0)
-                    budget_controller.record_tokens(total_tokens, cached_count=cached_tokens, cache_discount=0.1)
+                if getattr(event, "error_code", None):
+                    node_key = node_path or "unknown"
+                    errored.add(node_key)
+                    err_msg = getattr(event, "error_message", None) or f"ADK Event error: {event.error_code}"
+                    # Decided from the error CODE, which names an exception class
+                    # or a provider status, never from the message: ADK copies
+                    # model-authored text (a malformed call's finish message) into
+                    # error_message, and a scanned file can put "unauthenticated"
+                    # in that text. The code is not the model's to write.
+                    if str(event.error_code) in _AUTH_ERROR_CODES:
+                        raise MantisAuthError(err_msg)
+                    if event.error_code in ("BudgetExceededError", "LlmCallsLimitExceededError"):
+                        limit_val = budget_controller.config.max_llm_calls if budget_controller else 500
+                        raise BudgetExceededError(
+                            trigger="llm_calls_limit" if event.error_code == "LlmCallsLimitExceededError" else "budget_exceeded",
+                            current_value="limit exceeded",
+                            limit_value=limit_val,
+                            run_id=run_id,
+                            details=str(err_msg),
+                        )
+                    print(f"\n[EVENT ERROR {event.error_code}] {err_msg}", file=sys.stderr)
+                else:
+                    usage = getattr(event, "usage_metadata", None)
+                    if budget_controller and usage and getattr(usage, "total_token_count", None):
+                        total_tokens = int(usage.total_token_count)
+                        cached_tokens = int(getattr(usage, "cached_content_token_count", 0) or 0)
+                        budget_controller.record_tokens(total_tokens, cached_count=cached_tokens)
 
-                if hasattr(event, 'content') and event.content:
-                    is_partial = getattr(event, "partial", False)
-                    for part in getattr(event.content, "parts", []) or []:
-                        if hasattr(part, 'text') and part.text:
-                            # In streaming mode, print partial chunks incrementally.
-                            # Skip final aggregated non-partial text only if partial text was already streamed.
-                            if is_partial:
-                                cprint(part.text, end="", flush=True)
-                                streamed_partial_text = True
-                            elif not streamed_partial_text or run_cfg.streaming_mode != StreamingMode.SSE:
-                                cprint(part.text, end="", flush=True)
-                            if not is_partial:
-                                streamed_partial_text = False
-                                if budget_controller and not (usage and getattr(usage, "total_token_count", None)):
-                                    budget_controller.record_tokens(len(part.text) // 4)
-                            if current_active_node == "reporter" and db_path and run_id:
-                                try:
-                                    from core.schemas import ExecutiveReport
-                                    from core.database import record_artifact
-                                    rpt_text = part.text.strip()
-                                    if "```json" in rpt_text:
-                                        rpt_text = rpt_text.split("```json", 1)[1].split("```", 1)[0].strip()
-                                    elif "```" in rpt_text:
-                                        rpt_text = rpt_text.split("```", 1)[1].split("```", 1)[0].strip()
-                                    if rpt_text.startswith("{") and rpt_text.endswith("}"):
-                                        rpt_data = json.loads(rpt_text)
-                                        rpt_obj = ExecutiveReport.model_validate(rpt_data)
-                                        record_artifact(db_path, run_id, "report", "workspace/.structured/report.json", rpt_obj.model_dump_json(indent=2))
-                                except Exception:
-                                    pass
-                        elif hasattr(part, 'function_call') and part.function_call:
-                            call = part.function_call
-                            call_name = getattr(call, "name", "unknown_tool")
-                            call_args = getattr(call, "args", {})
-                            cprint(f"\n[TOOL CALL: {call_name}] args={call_args}", flush=True)
-                            if budget_controller:
-                                budget_controller.record_tool_call(current_active_node or "unknown", call_name)
-                        elif hasattr(part, 'function_response') and part.function_response:
-                            fn_resp = part.function_response
-                            fn_name = getattr(fn_resp, "name", "unknown_tool")
-                            raw_resp = getattr(fn_resp, "response", {})
-                            if isinstance(raw_resp, dict):
-                                resp_text = str(raw_resp.get("response") or raw_resp.get("result") or raw_resp.get("output") or raw_resp)
-                            else:
-                                resp_text = str(raw_resp)
-                            
-                            is_untrusted_data = resp_text.startswith("<<<UNTRUSTED_SOURCE_CODE_DATA_START")
-                            is_sandbox_error = fn_name in ("run_sandbox", "run_sandbox_with_evidence") and (
-                                "SANDBOX-ERROR:" in resp_text and not resp_text.startswith("exit=0")
-                            )
-                            is_fatal = not is_untrusted_data and (
-                                resp_text.startswith("SANDBOX-ERROR")
-                                or resp_text.startswith("ERROR SAVING DB")
-                                or resp_text.startswith("FATAL ERROR")
-                                or is_sandbox_error
-                            )
-                            is_validation_feedback = (
-                                not is_untrusted_data
-                                and not is_fatal
-                                and (
-                                    resp_text.startswith("Error")
-                                    or resp_text.startswith("ERROR")
+                    if hasattr(event, 'content') and event.content:
+                        is_partial = getattr(event, "partial", False)
+                        for part in getattr(event.content, "parts", []) or []:
+                            if hasattr(part, 'text') and part.text:
+                                # In streaming mode, print partial chunks incrementally.
+                                # Skip final aggregated non-partial text only if partial text was already streamed.
+                                if is_partial:
+                                    cprint(part.text, end="", flush=True)
+                                    streamed_partial_text = True
+                                elif not streamed_partial_text or run_cfg.streaming_mode != StreamingMode.SSE:
+                                    cprint(part.text, end="", flush=True)
+                                if not is_partial:
+                                    streamed_partial_text = False
+                                    if budget_controller and not (usage and getattr(usage, "total_token_count", None)):
+                                        budget_controller.record_tokens(len(part.text) // 4)
+                                if current_active_node == "reporter" and db_path and run_id:
+                                    try:
+                                        from core.schemas import ExecutiveReport
+                                        from core.database import record_artifact
+                                        rpt_text = part.text.strip()
+                                        if "```json" in rpt_text:
+                                            rpt_text = rpt_text.split("```json", 1)[1].split("```", 1)[0].strip()
+                                        elif "```" in rpt_text:
+                                            rpt_text = rpt_text.split("```", 1)[1].split("```", 1)[0].strip()
+                                        if rpt_text.startswith("{") and rpt_text.endswith("}"):
+                                            rpt_data = json.loads(rpt_text)
+                                            rpt_obj = ExecutiveReport.model_validate(rpt_data)
+                                            record_artifact(db_path, run_id, "report", "workspace/.structured/report.json", rpt_obj.model_dump_json(indent=2))
+                                    except Exception:
+                                        pass
+                            elif hasattr(part, 'function_call') and part.function_call:
+                                call = part.function_call
+                                call_name = getattr(call, "name", "unknown_tool")
+                                call_args = getattr(call, "args", {})
+                                cprint(f"\n[TOOL CALL: {call_name}] args={call_args}", flush=True)
+                                if budget_controller:
+                                    budget_controller.record_tool_call(current_active_node or "unknown", call_name)
+                            elif hasattr(part, 'function_response') and part.function_response:
+                                fn_resp = part.function_response
+                                fn_name = getattr(fn_resp, "name", "unknown_tool")
+                                raw_resp = getattr(fn_resp, "response", {})
+                                if isinstance(raw_resp, dict):
+                                    resp_text = str(raw_resp.get("response") or raw_resp.get("result") or raw_resp.get("output") or raw_resp)
+                                else:
+                                    resp_text = str(raw_resp)
+                                
+                                is_untrusted_data = resp_text.startswith("<<<UNTRUSTED_SOURCE_CODE_DATA_START")
+                                is_sandbox_error = fn_name in ("run_sandbox", "run_sandbox_with_evidence") and (
+                                    "SANDBOX-ERROR:" in resp_text and not resp_text.startswith("exit=0")
                                 )
-                                and "SANDBOX-UNAVAILABLE" not in resp_text
-                            )
+                                is_fatal = not is_untrusted_data and (
+                                    resp_text.startswith("SANDBOX-ERROR")
+                                    or resp_text.startswith("ERROR SAVING DB")
+                                    or resp_text.startswith("FATAL ERROR")
+                                    or is_sandbox_error
+                                )
+                                is_validation_feedback = (
+                                    not is_untrusted_data
+                                    and not is_fatal
+                                    and (
+                                        resp_text.startswith("Error")
+                                        or resp_text.startswith("ERROR")
+                                    )
+                                    and "SANDBOX-UNAVAILABLE" not in resp_text
+                                )
 
-                            if is_fatal:
-                                errored.add(f"tool:{fn_name}")
-                                cprint(f"\n[TOOL FATAL ERROR: {fn_name}] {resp_text}", file=sys.stderr, flush=True)
-                            elif is_validation_feedback:
-                                cprint(f"\n[TOOL FEEDBACK: {fn_name}] {resp_text}", flush=True)
-                            else:
-                                cprint(f"\n[TOOL RESPONSE: {fn_name}] {resp_text[:500]}", flush=True)
+                                if is_fatal:
+                                    errored.add(f"tool:{fn_name}")
+                                    cprint(f"\n[TOOL FATAL ERROR: {fn_name}] {resp_text}", file=sys.stderr, flush=True)
+                                elif is_validation_feedback:
+                                    cprint(f"\n[TOOL FEEDBACK: {fn_name}] {resp_text}", flush=True)
+                                else:
+                                    cprint(f"\n[TOOL RESPONSE: {fn_name}] {resp_text[:500]}", flush=True)
+
+            if _rearm_pass > 0 or errored or not saw_pseudo_tool_call or total_tool_calls > 0:
+                break
+            findings_count = 0
+            if db_path and os.path.exists(db_path):
+                try:
+                    findings_count = len(read_findings(db_path, run_id=run_id, scope_path=filepath))
+                except Exception:
+                    findings_count = 0
+            if not should_rearm_run(
+                findings_count,
+                total_tool_calls,
+                rearms_used=0,
+                pseudo_tool_call=saw_pseudo_tool_call,
+            ):
+                break
+            print("\n[ABORT GUARD] Re-arming run once after pseudo-tool-call turn.", flush=True)
+            pass_inv_id = None
+            pass_msg = types.Content(
+                parts=[types.Part.from_text(text=ABORT_GUARD_PROMPT)],
+                role="user",
+            )
     except LlmCallsLimitExceededError as le:
         limit_val = budget_controller.config.max_llm_calls if budget_controller else 500
         raise BudgetExceededError(
@@ -328,6 +398,11 @@ async def execute_sub_task(
     print("\n" + "-" * 60)
     return bool(errored)
 
+# The directory a repository keeps Mantis's own state in (a committed
+# knowledge export lives at .mantis/knowledge). Never a scan target.
+TOOL_STATE_DIR = ".mantis"
+
+
 def is_binary_file(path: Path, block_size: int = 1024) -> bool:
     """Returns True if the file contains null bytes in its initial block."""
     try:
@@ -336,11 +411,13 @@ def is_binary_file(path: Path, block_size: int = 1024) -> bool:
     except OSError:
         return True
 
-def discover_files(target: Path, db_path: str = "") -> list[str]:
+def discover_files(target: Path, db_path: str = "", exclude: tuple = ()) -> list[str]:
     """Source files under `target`. Uses git's own view when available —
-    a repo already declares what isn't source. Excludes binary files."""
+    a repo already declares what isn't source. Excludes binary files, and
+    anything matching the operator's `exclude` patterns (core.exclusions)."""
     if target.is_file():
         return [str(target)] if not is_binary_file(target) else []
+    found: Optional[list[str]] = None
     try:
         from tools.research_tools import _run_safe_git_command
         out, ok = _run_safe_git_command(
@@ -351,16 +428,33 @@ def discover_files(target: Path, db_path: str = "") -> list[str]:
         if ok and out:
             paths = [target / p for p in out.split("\0") if p]
             if paths:
-                return [
+                found = [
                     str(p) for p in sorted(paths)
                     if p.is_file() and not p.is_symlink() and str(p) != db_path and not is_binary_file(p)
                 ]
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
-    return [
-        str(p) for p in sorted(target.rglob("*"))
-        if p.is_file() and not p.is_symlink() and str(p) != db_path and not any(part.startswith(".") for part in p.parts) and not is_binary_file(p)
-    ]
+    if found is None:
+        found = [
+            str(p) for p in sorted(target.rglob("*"))
+            if p.is_file() and not p.is_symlink() and str(p) != db_path and not any(part.startswith(".") for part in p.parts) and not is_binary_file(p)
+        ]
+    # Tool state is never source. git's view includes a committed
+    # .mantis/knowledge; the dot-prefix rule above already drops it on the
+    # other path.
+    found = [f for f in found if TOOL_STATE_DIR not in Path(os.path.relpath(f, str(target))).parts]
+    if exclude:
+        from core.exclusions import is_excluded
+
+        found = [f for f in found if not is_excluded(os.path.relpath(f, str(target)), exclude)]
+    # Never a scan target, whatever the operator's patterns say: the
+    # credential configuration a CI auth step drops into the checkout
+    # (google-github-actions/auth writes gha-creds-<random>.json into
+    # $GITHUB_WORKSPACE; it is untracked, so `ls-files --others` lists it).
+    # The driver moves the file out of the tree, but a tree scanned without
+    # the driver -- a sweep -- must not read it either.
+    found = [f for f in found if not fnmatch.fnmatch(os.path.basename(f), "gha-creds-*.json")]
+    return found
 
 
 # How many ranked slices become campaigns when slicing engages.
@@ -455,6 +549,45 @@ _CONFIRM_CAMPAIGN_FLOOR = 50
 # callers and tests. A dict mutation rather than a module global so no caller
 # needs a `global` statement.
 _WORK_PLAN_DISCLOSURE: dict = {"focus": ""}
+
+
+# The run's BudgetController, parked here by the pipeline so that the process
+# exit path can write --spend-report whatever way the run ended: finished,
+# paused at a ceiling, failed, or refused by the provider. A driver that gives
+# this process a token allowance needs the figure in every one of those cases,
+# and a pause is the one case the spend ledger deliberately leaves out.
+_SPEND_REPORT: dict = {"controller": None}
+
+
+def write_spend_report(path: str, exit_code: Optional[int]) -> bool:
+    """Writes the run's spend as JSON to `path`. Never raises.
+
+    Written atomically (temp file + rename) so a reader never sees a partial
+    document. A run that ended before a controller existed reports zeros:
+    nothing was spent, and the absence of a file should mean only "killed
+    before it could say", not "nothing to say".
+    """
+    if not path:
+        return False
+    ctrl = _SPEND_REPORT.get("controller")
+    if ctrl is not None:
+        report = ctrl.spend_snapshot()
+    else:
+        report = {"run_id": "", "tokens": 0, "fresh_tokens": 0, "cached_tokens": 0,
+                  "cache_discount": None, "llm_calls": 0, "graph_steps": 0,
+                  "elapsed_seconds": 0.0, "max_tokens": None, "max_llm_calls": None,
+                  "pause_trigger": ""}
+    report["exit_code"] = exit_code
+    report["nodes"] = list(_SPEND_REPORT.get("nodes") or [])
+    try:
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+        os.replace(tmp, path)
+        return True
+    except Exception as exc:
+        print(f"[SPEND REPORT WARNING] could not write {path}: {exc}", file=sys.stderr)
+        return False
 
 
 def _confirm_work_plan(
@@ -661,7 +794,13 @@ def resolve_scan_targets(
             try:
                 from core.cost import uncovered_files
 
-                uncovered = uncovered_files(db_path, discovered_files)
+                # Coverage is asked per model: the sweep is of what THIS
+                # model has not seen, so knowledge built by several models
+                # has each of them cover every file.
+                from core.config import normalize_model_id
+
+                run_model = normalize_model_id(str(config.get("default_model") or ""))
+                uncovered = uncovered_files(db_path, discovered_files, model=run_model)
             except Exception as exc:
                 print(f"[LEDGER WARNING] {exc}", file=sys.stderr)
             if uncovered:
@@ -744,7 +883,8 @@ def resolve_scan_targets(
         astm = precomputed_astm
     else:
         try:
-            astm = survey(str(target_path), max_slices=max_slices)
+            astm = survey(str(target_path), max_slices=max_slices,
+                          exclude=tuple(config.get("exclude") or ()))
         except Exception as exc:
             # Degrade, never abort. A whole-target scan is a different question, not a
             # broken one, so falling back to it costs depth rather than the run.
@@ -1004,6 +1144,10 @@ async def pipeline(
     enable_context_cache: Optional[bool] = None,
     max_llm_calls_override: Optional[int] = None,
     max_node_tool_calls_override: Optional[int] = None,
+    max_tokens_override: Optional[int] = None,
+    cache_discount_override: Optional[float] = None,
+    exclude_override: Optional[list] = None,
+    import_knowledge_dir: str = "",
     precomputed_astm: Optional[dict] = None,
     scan_mode_override: Optional[str] = None,
     assume_yes: bool = False,
@@ -1014,8 +1158,22 @@ async def pipeline(
     seed_report_path: str = "",
     path_root: str = "",
     save_config: bool = False,
+    db_timeout: Optional[float] = None,
 ):
     """Main pipeline loop compiled declaratively from JSON specification."""
+    # SQLite serializes writers, and every parallel campaign writes findings
+    # and spend rows to the same file. The busy timeout is what separates a
+    # queued write from a dead campaign ("database is locked"), so it scales
+    # with the number of writers unless the operator pins it. Set in the
+    # environment because every connection in every module reads it there,
+    # including ones opened before this function returns.
+    from core.database import DB_TIMEOUT_ENV, DEFAULT_DB_TIMEOUT
+
+    if db_timeout is not None:
+        os.environ[DB_TIMEOUT_ENV] = str(max(0.0, float(db_timeout)))
+    elif not os.environ.get(DB_TIMEOUT_ENV):
+        os.environ[DB_TIMEOUT_ENV] = str(max(DEFAULT_DB_TIMEOUT, 15.0 * max(1, int(parallel or 1))))
+
     if not workflow_path:
         pipeline_dir = os.path.realpath(os.path.dirname(__file__))
         workflow_path = os.path.join(pipeline_dir, "workflow.json")
@@ -1100,13 +1258,71 @@ async def pipeline(
 
     db_path = config.get("db_path", "knowledge.db")
     init_db(db_path)
+    # The model this run uses, written down once so every record the run
+    # leaves -- findings, learnings, coverage, spend, all keyed by run id --
+    # can say who produced it. Knowledge built by several models depends on
+    # this, and so does the per-model sweep below.
+    run_model = ""
+    try:
+        from core.config import normalize_model_id
+        from core.database import record_run
 
-    discovered_files = discover_files(target_path, db_path)
+        run_model = normalize_model_id(str(config.get("default_model") or ""))
+        record_run(db_path, run_id, run_model)
+    except Exception as exc:
+        print(f"[RUN LEDGER WARNING] {exc}", file=sys.stderr)
+
+    # What not to scan: the workflow's `exclude` list plus any --exclude flags,
+    # as patterns relative to the target (core.exclusions). Resolved once here
+    # and carried to everything that chooses what to look at.
+    from core.exclusions import normalize_exclude_patterns
+
+    exclude = normalize_exclude_patterns(
+        list(normalize_exclude_patterns(config.get("exclude")))
+        + list(normalize_exclude_patterns(exclude_override)))
+    if exclude:
+        config = {**config, "exclude": list(exclude)}
+
+    discovered_files = discover_files(target_path, db_path, exclude=exclude)
     if not discovered_files:
-        print(f"Error: No source files found in target: {target_path}", file=sys.stderr)
+        print(f"Error: No source files found in target: {target_path}"
+              + (" after exclusions" if exclude else ""), file=sys.stderr)
         return 1
+    if exclude:
+        print(f"Excluding {', '.join(exclude)}: {len(discovered_files)} source file(s) in scope.",
+              file=sys.stderr)
 
+    if resume_run_id == "latest":
+        # --resume with no id: the most recent run this database recorded for
+        # this target. Looked up, never guessed: no run means nothing to
+        # resume, and the operator is told rather than handed a fresh one.
+        from core.cost import latest_run_id
+
+        resume_run_id = latest_run_id(db_path, str(target_path))
+        if not resume_run_id:
+            print(
+                f"Error: --resume: no earlier run recorded in {db_path} for {target_path}. "
+                "Start a run without --resume.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Resuming the most recent run: {resume_run_id}", file=sys.stderr)
     run_id = resume_run_id if resume_run_id else str(uuid.uuid4())
+    # Memory from the repository: a checked-in knowledge export, read into
+    # this database before anything chooses what to scan (coverage feeds auto
+    # mode) and under this run id (so the threat model and architecture are
+    # found by the tools that look for them). Explicit, never automatic: the
+    # files sit in the checkout, and an operator decides to trust them.
+    if import_knowledge_dir:
+        from core.knowledge import KnowledgeImportError, describe, import_knowledge
+
+        try:
+            imported = import_knowledge(db_path, import_knowledge_dir, run_id=run_id,
+                                        repo_root=str(path_root or target_path), target=str(target_path))
+        except KnowledgeImportError as exc:
+            print(f"Error: --import-knowledge: {exc}", file=sys.stderr)
+            return 1
+        print(f"Imported knowledge from {import_knowledge_dir}: {describe(imported)}.", file=sys.stderr)
     # Resolve budget configuration: explicit caller override > workflow.json budget > default BudgetConfig()
     resolved_budget = budget_config
     if resolved_budget is None:
@@ -1118,6 +1334,10 @@ async def pipeline(
         resolved_budget.max_llm_calls = max_llm_calls_override
     if max_node_tool_calls_override is not None:
         resolved_budget.max_node_tool_calls = max_node_tool_calls_override
+    if max_tokens_override is not None:
+        resolved_budget.max_tokens = max(0, int(max_tokens_override))
+    if cache_discount_override is not None:
+        resolved_budget.cache_discount = cache_discount_override
     # --no-budget: for operators with dedicated hardware or deep pockets. Zeroes
     # (= disables) exactly the two RUN-level spend ceilings. The campaign-level
     # runaway-loop guards keep their configured values on purpose: they answer
@@ -1128,6 +1348,9 @@ async def pipeline(
         resolved_budget.max_wall_clock_seconds = 0.0
         resolved_budget.max_tokens = 0
     budget_ctrl = BudgetController(config=resolved_budget, run_id=run_id)
+    # Kept where the process exit path can reach it: --spend-report writes
+    # this controller's totals however the run ends.
+    _SPEND_REPORT["controller"] = budget_ctrl
 
     # Target isolation: host target is treated as strictly read-only.
     # Mutations occur only in isolated guest sandboxes or under workspace/.
@@ -1165,6 +1388,18 @@ async def pipeline(
     # for one run must not rewrite the operator's file.
     if scan_mode_override:
         config = {**config, "scan_mode": normalize_scan_mode(scan_mode_override)}
+    elif resume_run_id:
+        # A resumed run keeps its scan mode. Without this, a file-by-file
+        # sweep picked up without the flag is re-resolved as `auto`, which
+        # plans one whole-target campaign for a small directory and reruns
+        # the wrong thing. The ledger rows carry the mode; an explicit flag
+        # still wins, and a run with no rows has nothing to inherit.
+        from core.cost import run_scan_mode
+
+        recorded_mode = run_scan_mode(db_path, run_id)
+        if recorded_mode:
+            config = {**config, "scan_mode": normalize_scan_mode(recorded_mode)}
+            print(f"[RESUME] Scan mode {recorded_mode}, as recorded for this run.", file=sys.stderr)
     targets_to_scan, astm, scan_mode = resolve_scan_targets(
         target_path,
         config,
@@ -1329,6 +1564,46 @@ async def pipeline(
                 f"ranked targets.",
                 file=sys.stderr,
             )
+
+    # A resumed run scans what it has not finished. The ledger says which
+    # campaigns completed; those are skipped, and the rest -- campaigns that
+    # failed and campaigns the run never reached -- are scanned under the same
+    # run id so findings, dedup and coverage carry on. Applied after the
+    # planner so a grouped plan is narrowed the same way. An unreadable
+    # ledger narrows nothing: rescanning is the safe direction.
+    if resume_run_id:
+        from core.cost import run_ledger
+
+        ledger = run_ledger(db_path, run_id)
+        if ledger is None:
+            print("[RESUME] Ledger unreadable; scanning the full plan.", file=sys.stderr)
+        else:
+            def _key(p: str) -> str:
+                return os.path.realpath(str(p)).rstrip("/")
+
+            completed = {_key(t) for t, row in ledger.items() if not row.get("failed")}
+            failed = {_key(t) for t, row in ledger.items() if row.get("failed")} - completed
+            planned = list(targets_to_scan)
+            remaining = [t for t in planned if _key(t) not in completed]
+            n_failed = sum(1 for t in remaining if _key(t) in failed)
+            n_new = len(remaining) - n_failed
+            print(
+                f"\n🔄 Resuming run {run_id}: {len(planned) - len(remaining)} of {len(planned)} "
+                f"campaign(s) completed; {n_failed} failed and {n_new} never started: "
+                f"{len(remaining)} to scan.",
+                file=sys.stderr,
+            )
+            if not remaining:
+                print("Nothing left to scan for this run. To scan again, start a new run.")
+                return 0
+            targets_to_scan = remaining
+            if plan_groups:
+                kept = set(_key(t) for t in remaining)
+                plan_groups = [
+                    {**g, "targets": [m for m in g["targets"] if _key(m) in kept]}
+                    for g in plan_groups
+                ]
+                plan_groups = [g for g in plan_groups if g["targets"]]
 
     # Price the plan we ended up with. Never fatal: an estimate is an aid to the
     # operator's decision, and failing to produce one must not stop the scan.
@@ -1549,10 +1824,6 @@ async def pipeline(
 
     if resume_run_id:
         existing_findings = read_findings(db_path, run_id=run_id)
-        if existing_findings and (not scan_target or scan_target == "."):
-            stored_target = existing_findings[0].get("target_file") or existing_findings[0].get("filepath")
-            if stored_target and os.path.exists(stored_target):
-                target_path = Path(stored_target).resolve()
         print(f"\n🔄 Resuming Run ID: {run_id} ({len(existing_findings)} existing finding(s) checkpointed)")
 
     print(f"Compiling Graph Pipeline. Target: {target_path} ({len(discovered_files)} source file(s) indexed)")
@@ -1618,6 +1889,9 @@ async def pipeline(
         budget_controller=budget_ctrl,
         scan_mode=scan_mode,
         path_root=resolved_path_root,
+        exclude=exclude,
+        model=run_model,
+        prefix_fingerprints=dict(config.get("prefix_fingerprints") or {}),
     )
 
     print(f"\n🚀 Engaging JSON Graph over target: {target_path} (Run ID: {run_id})...")
@@ -1962,6 +2236,11 @@ async def pipeline(
                     finally:
                         replan_lock.release()
             except BudgetExceededError as be:
+                # The first ceiling to trip names the pause; the ADK-raised
+                # call limit never passes through check_budget(), so it is
+                # recorded here rather than there.
+                if not run_budget.pause_trigger:
+                    run_budget.pause_trigger = str(be.trigger or "budget_exceeded")
                 # Report COVERAGE, not just budget. The banner already prints tokens,
                 # steps and elapsed time, but for a file-by-file scan the number that
                 # decides whether the result means anything is how much of the tree was
@@ -1989,11 +2268,11 @@ async def pipeline(
                 break
             except MantisAuthError as ae:
                 print(f"\n{ae}", file=sys.stderr)
-                return 1
+                return EXIT_AUTH
             except Exception as e:
                 if is_auth_error(e):
                     print(f"\n{format_auth_error_message(e)}", file=sys.stderr)
-                    return 1
+                    return EXIT_AUTH
                 print(f"PIPELINE CRITICAL ABORT IN TASK ({scan_item}): {e}", file=sys.stderr)
                 failures += 1
             finally:
@@ -2170,187 +2449,20 @@ async def pipeline(
         return 0
 
 
-def parse_cli_args():
-    import argparse
-    parser = argparse.ArgumentParser(description="Mantis Vulnerability Review Pipeline")
-    parser.add_argument("target", help="Directory or file to scan")
-    parser.add_argument("--workflow", "-w", type=str, default="", help="Path to workflow.json")
-    parser.add_argument(
-        "--sandbox",
-        "-s",
-        type=str,
-        choices=["static-only", "static", "gvisor", "microsandbox", "gce"],
-        help="Sandbox override",
-    )
-    parser.add_argument("--model", "-m", type=str, help="Global LLM model override")
-    parser.add_argument("--api-base", type=str, help="Custom LLM API Base URL")
-    parser.add_argument(
-        "--reasoning-effort",
-        type=str,
-        choices=["low", "medium", "high"],
-        help="Reasoning effort override",
-    )
-    parser.add_argument("--timeout", type=float, help="LLM timeout in seconds")
-    parser.add_argument("--db", "-d", type=str, help="Knowledge SQLite DB path")
-    parser.add_argument(
-        "--save-config",
-        action="store_true",
-        help=(
-            "Persist CLI overrides (--model, --db, --sandbox, ...) into "
-            "workflow.local.json. Without this flag overrides apply to this "
-            "run only."
-        ),
-    )
-    parser.add_argument(
-        "--no-auto-configure",
-        action="store_true",
-        help="Disable auto-configuration of unconfigured placeholders",
-    )
-    parser.add_argument(
-        "--no-compaction",
-        action="store_true",
-        help="Disable ADK event compaction",
-    )
-    parser.add_argument(
-        "--no-context-cache",
-        action="store_true",
-        help="Disable ADK context caching",
-    )
-    parser.add_argument(
-        "--max-llm-calls",
-        type=int,
-        default=None,
-        help="ADK LLM calls limit ceiling override (0 for unbounded, defaults to workflow budget)",
-    )
-    parser.add_argument(
-        "--max-node-tool-calls",
-        type=int,
-        default=None,
-        help="Per-node visit runaway tool loop ceiling override (defaults to workflow budget)",
-    )
-    # The budget pause banner prints a copy-pasteable "--resume <run_id>" command, and
-    # README documents it, but until now the flag existed only in scripts/launch.py.
-    # Anyone who launched main.py directly was told to run a flag argparse would reject.
-    # Harmless when a paused run was rare; routine once file-by-file scans are the
-    # default, because pausing on budget IS the normal way a large scan proceeds.
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default="",
-        help="Run ID to resume execution from where it paused",
-    )
-    parser.add_argument(
-        "--scan-mode",
-        type=str,
-        default=None,
-        choices=list(_SCAN_MODES),
-        help=(
-            "Scan mode. file-by-file asks one question of every file; "
-            "cross-functional hunts defects that span files. Defaults to the "
-            "workflow config, or auto."
-        ),
-    )
-    parser.add_argument(
-        "--yes",
-        "-y",
-        action="store_true",
-        help="Skip the work-plan confirmation prompt (for non-interactive use)",
-    )
-    parser.add_argument(
-        "--no-budget",
-        action="store_true",
-        help=(
-            "Disable the wall-clock and token spend ceilings (for dedicated "
-            "hardware or unmetered budgets). Runaway-loop guards stay active."
-        ),
-    )
-    parser.add_argument(
-        "--no-replan",
-        action="store_true",
-        help=(
-            "Disable dynamic replanning: freezes the campaign plan at run "
-            "start so a rerun holds the same plan (for reproducibility)."
-        ),
-    )
-    parser.add_argument(
-        "--parallel",
-        type=int,
-        default=1,
-        help=(
-            "Number of campaigns to run concurrently (default: 1, the "
-            "sequential behaviour). Run-level budget ceilings are shared "
-            "across workers; per-campaign guards stay per campaign."
-        ),
-    )
-    parser.add_argument(
-        "--focus",
-        type=str,
-        default="",
-        help=(
-            "Natural-language directive steering the campaign planner, e.g. "
-            "'look for IDOR' or 'find memory corruption issues'"
-        ),
-    )
-    parser.add_argument(
-        "--seed-report",
-        type=str,
-        default="",
-        help=(
-            "Path to a bug report file; the planner hunts variants of the "
-            "described bug, treating file content as untrusted evidence"
-        ),
-    )
-    parser.add_argument(
-        "--path-root",
-        type=str,
-        default="",
-        help=(
-            "Directory to store finding filepaths relative to (e.g. the "
-            "repository root when scanning a single file inside it); must "
-            "be an ancestor of the target"
-        ),
-    )
-    return parser.parse_args()
-
-
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: ./run.sh <directory_or_file_to_scan> [flags...]")
-        sys.exit(1)
+    # One command line for the whole project. The flags, their help and the
+    # usage exit code live in scripts/launch.py, which run.sh also calls;
+    # `python3 main.py ...` and `./run.sh ...` are the same program. A second
+    # parser here drifted twice (--scan-mode and --exclude existed only on
+    # this side, --token-budget and --max-time only on the other), and the
+    # pause banner was printing a resume command one of them rejected.
+    from scripts.launch import main as _launch_main
 
-    args = parse_cli_args()
     try:
-        exit_code = asyncio.run(
-            pipeline(
-                scan_target=args.target,
-                workflow_path=args.workflow,
-                model_override=args.model,
-                api_base_override=args.api_base,
-                sandbox_override=args.sandbox,
-                db_override=args.db,
-                timeout_override=args.timeout,
-                reasoning_effort_override=args.reasoning_effort,
-                auto_configure=not args.no_auto_configure,
-                enable_compaction=False if args.no_compaction else None,
-                enable_context_cache=False if args.no_context_cache else None,
-                max_llm_calls_override=args.max_llm_calls,
-                max_node_tool_calls_override=args.max_node_tool_calls,
-                resume_run_id=args.resume,
-                scan_mode_override=args.scan_mode,
-                assume_yes=args.yes,
-                no_budget=args.no_budget,
-                enable_replan=False if args.no_replan else None,
-                parallel=args.parallel,
-                focus=args.focus,
-                seed_report_path=args.seed_report,
-                path_root=args.path_root,
-                save_config=args.save_config,
-            )
-        )
-        sys.exit(exit_code)
+        sys.exit(_launch_main())
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_AUTH)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\nProcess aborted by user.")
         sys.exit(130)

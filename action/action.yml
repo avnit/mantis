@@ -1,0 +1,211 @@
+name: Mantis PR Scan
+description: >-
+  Audits the files a pull request changes with the Mantis vulnerability
+  pipeline and reports the verdict as annotations on the diff and a step
+  summary. Advisory by default; set fail-on to gate merges. Not yet run
+  end-to-end against a live project: see the status note at the top of
+  reference/docs/github-action.md before relying on it.
+author: Google
+branding:
+  icon: shield
+  color: green
+
+inputs:
+  base-sha:
+    description: Base commit the pull request diff is taken against.
+    required: false
+    default: ${{ github.event.pull_request.base.sha }}
+  model:
+    description: >-
+      Model id, any provider the pipeline (litellm) accepts: gemini-3.8-flash,
+      vertex_ai/gemini-3.8-flash, vertex_ai/claude-opus-5,
+      anthropic/claude-opus-5, openai/<name> with api-base, ... Credentials for
+      the chosen provider go in env on the step. A bare gemini-* name routes to
+      the Gemini API when GEMINI_API_KEY is set, otherwise to the Gemini
+      Enterprise Agent Platform (vertex_ai/) when a Google Cloud project is.
+    required: false
+    default: gemini-3.8-flash
+  api-base:
+    description: >-
+      Base URL of an OpenAI-compatible endpoint (self-hosted or gateway).
+      The action skips its own credential check; set whatever the endpoint
+      needs in env.
+    required: false
+    default: ""
+  max-llm-calls:
+    description: >-
+      LLM call ceiling per changed file: a loop guard, not the spend control
+      (that is max-tokens). A scan that reaches it pauses with what it found
+      so far stored and the file is reported as partially covered.
+    required: false
+    default: "400"
+  max-tokens:
+    description: >-
+      Token budget for the whole run, e.g. 10M or 500k. The hard limit on
+      what one run can spend: every token counts at full price, cached or
+      not; the budget is shared out equally over the files still to scan,
+      with a cheap file's unspent share passing to the next; a file the
+      budget cannot reach is reported unscanned (REVIEW). 0 removes the run
+      budget and leaves each scan the pipeline's own ceiling.
+    required: false
+    default: "10M"
+  daily-token-budget:
+    description: >-
+      Tokens the Google Cloud project may be served in any 24 hours, read
+      from the platform's own meter (Cloud Monitoring) before the run
+      starts. The run's budget is cut to what is left of the day; when
+      nothing is left, nothing is launched and every file is reported
+      unscanned (REVIEW). Needs roles/monitoring.viewer on the service
+      account; a budget that cannot be checked is a setup error (exit 3).
+      0 disables the check.
+    required: false
+    default: "100M"
+  max-input-tokens:
+    description: >-
+      Input tokens one model request may carry. Larger requests are refused
+      before dispatch, whatever the model's window and even for models the
+      pipeline cannot look up, so one call has a known maximum cost. 0
+      leaves only the model's own window.
+    required: false
+    default: "262144"
+  max-files:
+    description: >-
+      Changed files scanned per run. Files past the cap are reported as
+      unscanned, which floors the verdict at REVIEW.
+    required: false
+    default: "25"
+  per-file-timeout:
+    description: Seconds before one file's scan is abandoned (0 for none).
+    required: false
+    default: "1800"
+  ignore:
+    description: >-
+      Comma-separated fnmatch patterns of changed files to leave out of both
+      the scan and the gate. "default" means the built-in list of common
+      non-code files (docs, images, lockfiles); an empty string ignores
+      nothing.
+    required: false
+    default: default
+  fail-on:
+    description: >-
+      What the findings do to the job. none: advisory, the job passes
+      whatever the verdict. block: fail the job on BLOCK (an open
+      HIGH/CRITICAL finding in the changed lines or functions). review: fail
+      on REVIEW or BLOCK.
+    required: false
+    default: none
+  fail-closed:
+    description: >-
+      Whether Mantis being unable to look fails the job: a setup failure, a
+      model outage, a changed file the run could not scan (over max-files,
+      over budget, timed out, crashed), a crash in the driver. false (the
+      default) never fails the job for any of those -- the summary says what
+      was not audited and the verdict carries REVIEW, but a broken scanner
+      does not stop a merge. true: a green check means every changed file
+      was audited in full.
+    required: false
+    default: "false"
+  python-version:
+    description: Python version for the pipeline (3.12 or newer).
+    required: false
+    default: "3.13"
+
+outputs:
+  verdict:
+    description: PASS, REVIEW, or BLOCK; NOT_RUN when a setup failure stopped the scan.
+    value: ${{ steps.scan.outputs.verdict }}
+  report:
+    description: Path of the JSON report (verdict, findings, blast radius, scan results).
+    value: ${{ steps.scan.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    # Both steps run from the action's own directory with PYTHONSAFEPATH set.
+    # A composite step's default working directory is the checkout -- the
+    # pull request -- and `python -m` puts the working directory first on
+    # sys.path, so a pull request carrying pip/__init__.py would be what
+    # `python -m pip` imported, before any of the controls below existed.
+    - name: Install Mantis
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        PYTHONSAFEPATH: "1"
+      run: |
+        python -P -m pip install --quiet --require-hashes \
+          -r "$GITHUB_ACTION_PATH/../reference/requirements.txt"
+
+    # The auth action writes its credential configuration into the checkout.
+    # That file is the credential: it holds the URL and token the job uses to
+    # mint identity tokens. Move it out of the tree the pipeline reads before
+    # the scan starts, so nothing that reads the pull request -- the model's
+    # tools, a sweep, a planted script -- can read it, and point every client
+    # at the new location.
+    - name: Move the credential out of the checkout
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
+          case "$GOOGLE_APPLICATION_CREDENTIALS" in
+            "$GITHUB_WORKSPACE"/*)
+              dest="$RUNNER_TEMP/mantis-credentials.json"
+              install -m 0600 "$GOOGLE_APPLICATION_CREDENTIALS" "$dest"
+              rm -f -- "$GOOGLE_APPLICATION_CREDENTIALS"
+              {
+                echo "GOOGLE_APPLICATION_CREDENTIALS=$dest"
+                echo "GOOGLE_GHA_CREDS_PATH=$dest"
+                echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=$dest"
+              } >> "$GITHUB_ENV"
+              ;;
+          esac
+        fi
+
+    - name: Scan the pull request
+      id: scan
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        PYTHONSAFEPATH: "1"
+        LITELLM_MODE: PRODUCTION
+        MANTIS_ACTION_BASE_SHA: ${{ inputs.base-sha }}
+        MANTIS_ACTION_MODEL: ${{ inputs.model }}
+        MANTIS_ACTION_API_BASE: ${{ inputs.api-base }}
+        MANTIS_ACTION_MAX_LLM_CALLS: ${{ inputs.max-llm-calls }}
+        MANTIS_ACTION_MAX_TOKENS: ${{ inputs.max-tokens }}
+        MANTIS_ACTION_DAILY_TOKEN_BUDGET: ${{ inputs.daily-token-budget }}
+        MANTIS_ACTION_MAX_INPUT_TOKENS: ${{ inputs.max-input-tokens }}
+        MANTIS_ACTION_MAX_FILES: ${{ inputs.max-files }}
+        MANTIS_ACTION_PER_FILE_TIMEOUT: ${{ inputs.per-file-timeout }}
+        MANTIS_ACTION_IGNORE: ${{ inputs.ignore }}
+        MANTIS_ACTION_FAIL_ON: ${{ inputs.fail-on }}
+        MANTIS_ACTION_FAIL_CLOSED: ${{ inputs.fail-closed }}
+      run: |
+        report="$RUNNER_TEMP/mantis-pr-scan.json"
+        args=(
+          --repo "$GITHUB_WORKSPACE"
+          --base "$MANTIS_ACTION_BASE_SHA"
+          --model "$MANTIS_ACTION_MODEL"
+          --max-llm-calls "$MANTIS_ACTION_MAX_LLM_CALLS"
+          --max-tokens "$MANTIS_ACTION_MAX_TOKENS"
+          --daily-token-budget "$MANTIS_ACTION_DAILY_TOKEN_BUDGET"
+          --max-input-tokens "$MANTIS_ACTION_MAX_INPUT_TOKENS"
+          --max-files "$MANTIS_ACTION_MAX_FILES"
+          --per-file-timeout "$MANTIS_ACTION_PER_FILE_TIMEOUT"
+          --fail-on "$MANTIS_ACTION_FAIL_ON"
+          --output-json "$report"
+          --state-dir "$RUNNER_TEMP"
+        )
+        if [ -n "$MANTIS_ACTION_API_BASE" ]; then
+          args+=(--api-base "$MANTIS_ACTION_API_BASE")
+        fi
+        if [ "$MANTIS_ACTION_IGNORE" != "default" ]; then
+          args+=(--ignore "$MANTIS_ACTION_IGNORE")
+        fi
+        case "$MANTIS_ACTION_FAIL_CLOSED" in
+          true|True|TRUE|yes|1) args+=(--fail-closed) ;;
+        esac
+        python "$GITHUB_ACTION_PATH/../reference/scripts/pr_scan.py" "${args[@]}"

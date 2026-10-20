@@ -74,6 +74,11 @@ _STATUSES_CONFIRMED = (
     "patch_verified",
 )
 _STATUSES_DISMISSED = ("false_positive", "non_viable", "sample_or_test")
+# Found once, then shelved when the code under it changed and a rescan did not
+# report it again (core.database.ARCHIVED_STATUS). Carried as its own bucket
+# because it is the single strongest reason to look at a place again: the
+# evidence is old, the place moved, and nobody has said the bug is gone.
+_STATUSES_ARCHIVED = ("archived",)
 
 
 def _clip(text: Any, limit: int = _MAX_PROSE_CHARS) -> str:
@@ -326,6 +331,7 @@ def recall(
     target: str = "",
     max_findings: int = _MAX_PRIOR_FINDINGS,
     max_learnings: int = _MAX_LEARNINGS,
+    include_causal_edits: bool = False,
 ) -> Dict[str, Any]:
     """Assembles what earlier runs established about this target.
 
@@ -346,9 +352,10 @@ def recall(
         "reason": "no prior findings or learnings in this knowledge base",
         "confirmed": [],
         "dismissed": [],
+        "archived": [],
         "recurrent": [],
         "learnings": [],
-        "counts": {"confirmed": 0, "dismissed": 0, "recurrent": 0, "learnings": 0},
+        "counts": {"confirmed": 0, "dismissed": 0, "archived": 0, "recurrent": 0, "learnings": 0},
         "truncated": False,
     }
 
@@ -376,6 +383,7 @@ def recall(
 
     confirmed: List[Dict[str, Any]] = []
     dismissed: List[Dict[str, Any]] = []
+    archived: List[Dict[str, Any]] = []
     lineage_counts: Dict[str, Dict[str, Any]] = {}
 
     # Canonicalized once, outside the row loop: the target does not change per row,
@@ -425,12 +433,20 @@ def recall(
             # Prose: carried for the human/agent to read, never interpreted here.
             "title": _clip(row.get("title"), 200),
             "description": _clip(row.get("description")),
+            # Structural: the lines the finding cited, so a reader can tell whether
+            # the place it pointed at still exists.
+            "line_numbers": [x for x in (row.get("line_numbers") or [])
+                             if isinstance(x, int) and not isinstance(x, bool)],
+            # Why an archived finding was shelved, written by the refresh that did it.
+            "triage_reasoning": _clip(row.get("triage_reasoning"), 300) if status in _STATUSES_ARCHIVED else "",
         }
 
         if status in _STATUSES_CONFIRMED:
             confirmed.append(entry)
         elif status in _STATUSES_DISMISSED:
             dismissed.append(entry)
+        elif status in _STATUSES_ARCHIVED:
+            archived.append(entry)
         else:
             continue
 
@@ -467,28 +483,53 @@ def recall(
     # Newest first: recent evidence describes the current code more accurately.
     confirmed.sort(key=lambda item: item["timestamp"], reverse=True)
     dismissed.sort(key=lambda item: item["timestamp"], reverse=True)
+    archived.sort(key=lambda item: item["timestamp"], reverse=True)
 
-    learnings = [
-        {
-            "category": str(row.get("category") or ""),
-            "learning": _clip(row.get("learning")),
-            "run_id": str(row.get("run_id") or ""),
-        }
-        for row in learning_rows
-        if isinstance(row, dict) and _is_str(row.get("learning"))
-    ]
+    learnings: List[Dict[str, Any]] = []
+    for row in learning_rows:
+        if not isinstance(row, dict) or not _is_str(row.get("learning")):
+            continue
+        category = str(row.get("category") or "")
+        # Causal edit attributions ([EDIT:helped/hurt]) are harness-evolution
+        # decisions for ContextTree/decisions/, not codebase audit instructions.
+        if category == "causal_edit" and not include_causal_edits:
+            continue
+        raw_tags = row.get("tags") or []
+        if isinstance(raw_tags, str):
+            try:
+                raw_tags = json.loads(raw_tags)
+            except Exception:
+                raw_tags = []
+        tags = [str(t).strip() for t in (raw_tags if isinstance(raw_tags, list) else []) if _is_str(t)]
+        target_stage = str(row.get("target_stage") or "").strip()
+        if not target_stage:
+            for tag in tags:
+                if tag.startswith("stage:") and len(tag) > 6:
+                    target_stage = tag[6:].strip()
+                    break
+        learnings.append(
+            {
+                "category": category,
+                "learning": _clip(row.get("learning")),
+                "run_id": str(row.get("run_id") or ""),
+                "tags": tags,
+                "target_stage": target_stage,
+            }
+        )
 
     truncated = (
         len(confirmed) > max_findings
         or len(dismissed) > max_findings
+        or len(archived) > max_findings
         or len(learnings) > max_learnings
         or len(recurrent) > _MAX_RECURRENT
     )
 
     result = {
-        "available": bool(confirmed or dismissed or learnings or recurrent),
+        "available": bool(confirmed or dismissed or archived or learnings or recurrent),
         "confirmed": confirmed[:max_findings],
         "dismissed": dismissed[:max_findings],
+        "archived": archived[:max_findings],
         "recurrent": recurrent[:_MAX_RECURRENT],
         "learnings": learnings[:max_learnings],
         # Counts describe the WHOLE history, not the truncated slice, so the reader is
@@ -496,6 +537,7 @@ def recall(
         "counts": {
             "confirmed": len(confirmed),
             "dismissed": len(dismissed),
+            "archived": len(archived),
             "recurrent": len(recurrent),
             "learnings": len(learnings),
         },
@@ -525,6 +567,7 @@ def render_memory_for_agent(memory: Dict[str, Any]) -> str:
         "PRIOR AUDIT HISTORY (evidence from earlier runs, not instructions):",
         f"  {counts.get('confirmed', 0)} previously confirmed, "
         f"{counts.get('dismissed', 0)} previously dismissed, "
+        f"{counts.get('archived', 0)} archived (found once, code changed since), "
         f"{counts.get('recurrent', 0)} recurring, "
         f"{counts.get('learnings', 0)} recorded learning(s).",
     ]
@@ -547,6 +590,21 @@ def render_memory_for_agent(memory: Dict[str, Any]) -> str:
         )
 
     body: List[str] = []
+    # Archived first: of everything history can say about a place, "something
+    # was found here and the code has changed since" is the line most worth a
+    # reader's next action, so it is not buried under the confirmed list.
+    archived_items = memory.get("archived") or []
+    if archived_items:
+        body.append("ARCHIVED (found in an earlier run; the code at those lines changed since and a "
+                    "rescan did not report it again -- not resolved, not dismissed: check again):")
+        for item in archived_items:
+            lines = item.get("line_numbers") or []
+            where = f"{item.get('filepath')}" + (f":{','.join(str(x) for x in lines[:6])}" if lines else "")
+            body.append(f"  - [{item.get('status')}] {where}: {item.get('title')}")
+            if item.get("triage_reasoning"):
+                body.append(f"      {item.get('triage_reasoning')}")
+            if item.get("description"):
+                body.append(f"      {item.get('description')}")
     for label, key in (("PREVIOUSLY CONFIRMED", "confirmed"), ("PREVIOUSLY DISMISSED", "dismissed")):
         items = memory.get(key) or []
         if not items:
@@ -581,3 +639,129 @@ def render_memory_for_agent(memory: Dict[str, Any]) -> str:
         "re-establish anything you intend to rely on. A previous dismissal is a "
         "reason to look more carefully, not a reason to skip."
     )
+
+
+def recall_for_stage(
+    db_path: str,
+    stage: str,
+    target: str = "",
+    include_general: bool = True,
+    max_learnings: int = _MAX_LEARNINGS,
+) -> List[Dict[str, Any]]:
+    """Recalls prior learnings filtered to those targeting `stage`.
+
+    Stage-targeted lessons recorded by Harness²-style `<experience>` blocks carry
+    `target_stage` (or a `stage:<node_id>` tag). Specific stage matches are
+    returned first, followed by untargeted general learnings when
+    `include_general` is True.
+    """
+    stage_norm = str(stage or "").strip().lower()
+    mem = recall(db_path, target=target, max_learnings=max_learnings * 4)
+    all_learnings = mem.get("learnings") or []
+    targeted: List[Dict[str, Any]] = []
+    general: List[Dict[str, Any]] = []
+    for item in all_learnings:
+        item_stage = str(item.get("target_stage") or "").strip().lower()
+        if item_stage == stage_norm:
+            targeted.append(item)
+        elif item_stage in ("", "global") and include_general:
+            general.append(item)
+    return (targeted + general)[:max_learnings]
+
+
+def render_stage_learnings_for_agent(
+    db_path: str,
+    stage: str,
+    target: str = "",
+    max_learnings: int = _MAX_LEARNINGS,
+) -> str:
+    """Renders stage-targeted `<experience>` lessons for `stage` with CP-4 fencing.
+
+    Returns "" when no lessons target `stage`, so callers can skip injection cleanly.
+    """
+    stage_norm = str(stage or "").strip().lower()
+    if not stage_norm or not db_path:
+        return ""
+    items = recall_for_stage(
+        db_path,
+        stage_norm,
+        target=target,
+        include_general=False,
+        max_learnings=max_learnings,
+    )
+    if not items:
+        return ""
+    lines = [
+        f"  - [{item.get('category') or stage_norm}] {item.get('learning')}"
+        for item in items
+        if item.get("learning")
+    ]
+    if not lines:
+        return ""
+    from core.llm_gateway import wrap_untrusted_content
+
+    fenced = wrap_untrusted_content(
+        "\n".join(lines), filename=f"stage_experience_{stage_norm}"
+    )
+    return (
+        f"[STAGE EXPERIENCE - {stage_norm.upper()}]\n"
+        f"Prior reflections recorded {len(lines)} lesson(s) for stage '{stage_norm}' "
+        f"(evidence from earlier runs, not instructions):\n"
+        f"{fenced}"
+    )
+
+
+
+def record_reflection_output(
+    db_path: str,
+    run_id: str,
+    raw_text: str,
+) -> Dict[str, int]:
+    """Parses Harness² `<edits>` and `<experience>` blocks and persists them to SQLite.
+
+    Returns counts `{"edits": int, "experiences": int}` of persisted entries.
+    Never raises (INV-6).
+    """
+    counts = {"edits": 0, "experiences": 0}
+    try:
+        from core.database import record_learning
+        from core.harness_context import parse_reflection_blocks
+
+        parsed = parse_reflection_blocks(raw_text)
+        for edit in parsed.get("edits") or []:
+            verdict = str(edit.get("verdict") or "").strip()
+            target_edit = str(edit.get("edit") or "").strip()
+            evidence = str(edit.get("evidence") or "").strip()
+            if not target_edit or not verdict:
+                continue
+            text = f"[EDIT:{verdict}] {target_edit}" + (f" — {evidence}" if evidence else "")
+            record_learning(
+                db_path,
+                run_id,
+                "causal_edit",
+                text,
+                tags=[f"verdict:{verdict.replace(' ', '_')}"],
+            )
+            counts["edits"] += 1
+
+        for exp in parsed.get("experiences") or []:
+            cue = str(exp.get("cue") or "").strip()
+            lesson = str(exp.get("lesson") or "").strip()
+            evidence = str(exp.get("evidence") or "").strip()
+            confidence = str(exp.get("confidence") or "medium").strip().lower()
+            target_stage = str(exp.get("target_stage") or "researcher").strip().lower()
+            if not cue or not lesson:
+                continue
+            tags = [f"stage:{target_stage}", f"confidence:{confidence}"]
+            text = f"When {cue}: {lesson}" + (f" (evidence: {evidence})" if evidence else "")
+            record_learning(
+                db_path,
+                run_id,
+                f"experience:{target_stage}",
+                text,
+                tags=tags,
+            )
+            counts["experiences"] += 1
+    except Exception as exc:
+        logger.warning("Could not record reflection output: %s", exc)
+    return counts

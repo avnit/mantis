@@ -26,6 +26,71 @@ class _NoAnchorLoader(yaml.SafeLoader):
 
 CURRENT_SCHEMA_VERSION = 3
 
+# How long a connection waits for the write lock before giving up. SQLite
+# serializes writers; under --parallel N, N campaigns record findings and
+# spend rows against one file, and a wait longer than this surfaces as
+# "database is locked" and kills the campaign. Python's default is 5s, which
+# a dozen concurrent writers exceed routinely (reported from the field at
+# --parallel 20). The pipeline raises this with parallelism; the operator
+# can set it outright with --db-timeout or MANTIS_DB_TIMEOUT (seconds).
+DEFAULT_DB_TIMEOUT = 60.0
+DB_TIMEOUT_ENV = "MANTIS_DB_TIMEOUT"
+
+_journal_mode_set: set = set()
+
+
+def db_timeout() -> float:
+    """The busy timeout in effect, in seconds."""
+    raw = os.environ.get(DB_TIMEOUT_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value >= 0:
+                return value
+        except ValueError:
+            pass
+        logger.warning("Ignoring invalid %s=%r; using %.0fs", DB_TIMEOUT_ENV, raw, DEFAULT_DB_TIMEOUT)
+    return DEFAULT_DB_TIMEOUT
+
+
+def connect(db_path: str, timeout: Optional[float] = None,
+            readonly: bool = False) -> sqlite3.Connection:
+    """The one way to open the knowledge database for reading or writing.
+
+    Sets the busy timeout (see db_timeout) and, once per path per process,
+    switches the file to write-ahead logging so readers never block the
+    writer and the writer never blocks readers; only writers still serialize,
+    and they wait rather than fail. WAL is a property of the file, so every
+    later connection from any process inherits it. If the filesystem refuses
+    (some network mounts), the default journal stays and only the timeout
+    applies. Callers that need a path outside the knowledge database (the
+    structural catalog, scratch copies) keep their own connections.
+    """
+    wait = db_timeout() if timeout is None else timeout
+    if readonly:
+        # mode=ro: SQLite will neither create the file nor write to it; the
+        # journal pragmas below are skipped because they would be writes.
+        from urllib.parse import quote
+
+        return sqlite3.connect(f"file:{quote(str(db_path))}?mode=ro", uri=True, timeout=wait)
+    conn = sqlite3.connect(db_path, timeout=wait)
+    if db_path != ":memory:":
+        try:
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+            mode = str(row[0]).lower() if row else ""
+            if mode != "wal" and db_path not in _journal_mode_set:
+                row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                mode = str(row[0]).lower() if row else mode
+                if mode == "wal":
+                    _journal_mode_set.add(db_path)
+            if mode == "wal":
+                # Per connection, not per file: durable across process crashes,
+                # and the WAL makes FULL unnecessary.
+                conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            pass  # read-only media or a filesystem without shared-memory support
+    return conn
+
 ACTIVE_STATUSES = (
     "reported",
     "static_confirmed",
@@ -45,7 +110,26 @@ ALL_STATUSES = ACTIVE_STATUSES + FALSE_POSITIVE_STATUSES
 # Statuses meaning "looked at and set aside". One definition, because the cost of
 # these drifting apart is silent: a finding counted as live in one place and dead in
 # another.
-SUPPRESSED_STATUSES = FALSE_POSITIVE_STATUSES + ("duplicate_merged", "reported")
+SUPPRESSED_STATUSES = FALSE_POSITIVE_STATUSES + ("duplicate_merged", "reported", "archived")
+
+# A finding whose lines the code moved out from under it, and which a rescan
+# of that file, with the finding in front of it, did not report again. Not a
+# verdict: the finding is shelved with its history, it does not gate, it is
+# surfaced as a notice whenever its file is touched, and any later report of
+# the same lineage reopens it. The name is the hint: something was found here
+# once, and the place has changed since. Deliberately NOT a monotonic
+# terminal status, so a re-report can always move it.
+ARCHIVED_STATUS = "archived"
+
+# Statuses a re-reported finding can never be moved off by write_findings:
+# machine proof (dynamic_confirmed, patch_verified) and recorded closures
+# (dismissals, merges, mitigations). A later report restating the finding is
+# an opinion; only the harness's own stamps (update_status, merge_findings
+# within a run) may change these, under _terminal_clause_for.
+MONOTONIC_TERMINAL_STATUSES = frozenset({
+    "dynamic_confirmed", "patch_verified", "mitigated",
+    "false_positive", "duplicate_merged", "non_viable", "sample_or_test",
+})
 
 
 def is_suppressed(status: Any) -> bool:
@@ -69,7 +153,7 @@ def _db(db_path: str, check_version: bool = True):
     # is where the path is anchored to the installation and refused if it is (or traverses)
     # a symlink. See core.paths.resolve_db_path.
     db_path = resolve_db_path(db_path)
-    conn = sqlite3.connect(db_path)
+    conn = connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         if check_version:
@@ -210,6 +294,20 @@ def init_db(db_path: str):
                 cursor.execute("ALTER TABLE findings ADD COLUMN embedding BLOB")
             if "code_paths" not in existing_cols:
                 cursor.execute("ALTER TABLE findings ADD COLUMN code_paths TEXT DEFAULT '[]'")
+
+        # Which model a run used. Every record the pipeline writes already
+        # carries its run id, so provenance is a join away without touching
+        # the findings, learnings or spend tables; knowledge built by more
+        # than one model keeps, per record, who found what and who covered
+        # what.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                model TEXT,
+                started DATETIME DEFAULT CURRENT_TIMESTAMP,
+                metadata_json TEXT DEFAULT '{}'
+            )
+        """)
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_filepath ON findings(filepath)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_lineage ON findings(lineage_id)")
@@ -643,8 +741,17 @@ def resolve_ancestor_lineage(
     return str(uuid.uuid4())
 
 
-def write_findings(db_path: str, filepath: str, findings: list, run_id: str = "", status: str = ""):
-    """Write structured findings to the database contextually associated with their canonical filepaths, stable signatures, lineages, and RCA summaries."""
+def write_findings(db_path: str, filepath: str, findings: list, run_id: str = "", status: str = "",
+                   verified_evidence: Optional[bool] = None):
+    """Write structured findings to the database contextually associated with their canonical filepaths, stable signatures, lineages, and RCA summaries.
+
+    `verified_evidence` is the harness's own record of whether this run has
+    reached-sink evidence (RunContext.sandbox_executed). When it is given and
+    False, a model-claimed patch_status of VERIFIED_SECURE is stored as
+    VERIFICATION_INCOMPLETE: both fields the old gate compared were filled in
+    by the same model, so a static-only run could export a "verified" patch.
+    None keeps the old behaviour for callers that have no run context.
+    """
     with _db(db_path) as conn:
         cursor = conn.cursor()
         for obj in findings:
@@ -760,6 +867,11 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             # VERIFIED_SECURE is strictly forbidden unless reattack_status is failed_to_bypass
             if patch_status == "VERIFIED_SECURE" and reattack_status != "failed_to_bypass":
                 patch_status = "VERIFICATION_INCOMPLETE"
+            # ... and unless the harness itself saw the sandbox reach a sink
+            # this run. reattack_status is model-filled too; without this,
+            # the model's word was the only input to a "verified" badge.
+            if patch_status == "VERIFIED_SECURE" and verified_evidence is False:
+                patch_status = "VERIFICATION_INCOMPLETE"
 
             raw_code_paths = finding.get("code_paths")
             if raw_code_paths and isinstance(raw_code_paths, (list, tuple, set)):
@@ -790,7 +902,11 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
             # Check if updating an existing record by explicit ID or exact composite key
             target_id = None
             if finding.get("id") and isinstance(finding.get("id"), int):
-                cursor.execute("SELECT id FROM findings WHERE id = ? LIMIT 1", (finding["id"],))
+                # Scoped to this run: an id is a small integer a model can
+                # guess, and rows of other runs -- imported knowledge above
+                # all -- are not this run's to rewrite.
+                cursor.execute("SELECT id FROM findings WHERE id = ? AND run_id = ? LIMIT 1",
+                               (finding["id"], run_id))
                 id_row = cursor.fetchone()
                 if id_row:
                     target_id = id_row[0]
@@ -809,6 +925,28 @@ def write_findings(db_path: str, filepath: str, findings: list, run_id: str = ""
                     target_id = match_row[0]
 
             if target_id:
+                # INV-5 on the row that will actually be rewritten, for EVERY
+                # incoming status. The guard above keys on signature/lineage
+                # and only fires for an incoming `reported`/`static_confirmed`;
+                # a re-report that matched by id or composite key with status
+                # FALSE_POSITIVE or VALID walked straight past it, so a model
+                # could demote a dynamic_confirmed finding (and blank its
+                # verified patch) or revive a dismissed one by restating it.
+                # Machine proof and recorded dismissals both outrank a
+                # restatement; a dismissal is undone only by a stamp from a
+                # sandbox-backed node, never by a report.
+                cursor.execute(
+                    "SELECT status, patch_status, patch_diff FROM findings WHERE id = ?",
+                    (target_id,),
+                )
+                prev = cursor.fetchone()
+                prev_status = str((prev[0] if prev else "") or "").strip().lower()
+                if prev_status in MONOTONIC_TERMINAL_STATUSES and finding_status != prev_status:
+                    finding_status = prev_status
+                if prev and not patch_status:
+                    patch_status = str(prev[1] or "")
+                if prev and not patch_diff:
+                    patch_diff = str(prev[2] or "")
                 cursor.execute("""
                     UPDATE findings SET
                         filepath = ?, title = ?, severity = ?, description = ?, line_numbers = ?,
@@ -909,6 +1047,11 @@ def _terminal_clause_for(status: str) -> str:
         # verdict, and the reverse direction would let one bad review erase
         # a reproduced vulnerability.
         return "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'dynamic_confirmed', 'patch_verified', 'false_positive', 'non_viable', 'sample_or_test')"
+    if status == "duplicate_merged":
+        # A merge is bookkeeping by the deduplicator model. It may fold
+        # unproven rows together; it may not fold away machine proof (the
+        # confirmed row is the one to keep) or reopen a recorded closure.
+        return "AND LOWER(status) NOT IN ('duplicate_merged', 'mitigated', 'dynamic_confirmed', 'patch_verified', 'false_positive', 'non_viable', 'sample_or_test')"
     return "AND LOWER(status) NOT IN ('duplicate_merged', 'false_positive', 'non_viable', 'sample_or_test', 'mitigated')"
 
 
@@ -939,6 +1082,31 @@ def _campaign_scope_clause(norm_path: str) -> "tuple[str, List[str]]":
         '%"' + escaped + ':%',
     ]
     return clause, params
+
+
+def archive_finding(db_path: str, lineage_id: str, note: str = "") -> int:
+    """Shelves every still-open row of a lineage as `archived` (see
+    ARCHIVED_STATUS). Rows already at a monotonic terminal status, or already
+    archived, are left alone. `note` is appended to triage_reasoning so the
+    export says why. Returns the number of rows changed. Never raises (INV-6)."""
+    lineage_id = str(lineage_id or "").strip()
+    if not lineage_id:
+        return 0
+    terminal = ",".join("?" * len(MONOTONIC_TERMINAL_STATUSES))
+    params = [ARCHIVED_STATUS, (note or "")[:2000], lineage_id, ARCHIVED_STATUS, *sorted(MONOTONIC_TERMINAL_STATUSES)]
+    try:
+        with _db(db_path) as conn:
+            cur = conn.execute(f"""
+                UPDATE findings
+                SET status = ?,
+                    triage_reasoning = TRIM(COALESCE(triage_reasoning, '') || CHAR(10) || ?)
+                WHERE lineage_id = ?
+                  AND LOWER(COALESCE(status, '')) != ?
+                  AND LOWER(COALESCE(status, '')) NOT IN ({terminal})
+            """, params)
+            return int(cur.rowcount or 0)
+    except Exception:
+        return 0
 
 
 def update_status(db_path: str, filepath: str, run_id: str, status: str):
@@ -1658,9 +1826,29 @@ def record_artifact(db_path: str, run_id: str, artifact_type: str, filepath: str
 
 def read_artifact(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None) -> Optional[str]:
     """Retrieve an artifact's content from the database by filepath or artifact_type strictly scoped to run_id when provided."""
+    rec = read_artifact_record(db_path, filepath=filepath, artifact_type=artifact_type, run_id=run_id)
+    return rec["content"] if rec else None
+
+
+def artifact_is_imported(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None) -> bool:
+    """Whether the artifact a read would return came from a knowledge import
+    rather than from this run's own tools. Imported text is a repository's
+    file: it is read as untrusted content, fenced, not as the run's memory."""
+    rec = read_artifact_record(db_path, filepath=filepath, artifact_type=artifact_type, run_id=run_id)
+    if not rec:
+        return False
+    try:
+        meta = json.loads(rec.get("metadata_json") or "{}")
+    except ValueError:
+        return False
+    return isinstance(meta, dict) and bool(meta.get("imported"))
+
+
+def read_artifact_record(db_path: str, filepath: str = "", artifact_type: str = "", run_id: Optional[str] = None) -> Optional[dict]:
+    """The latest matching artifact row as {content, metadata_json}, or None."""
     with _db(db_path) as conn:
         cursor = conn.cursor()
-        query = "SELECT content FROM campaign_artifacts WHERE 1=1"
+        query = "SELECT content, metadata_json FROM campaign_artifacts WHERE 1=1"
         params = []
         if filepath:
             query += " AND filepath = ?"
@@ -1675,14 +1863,107 @@ def read_artifact(db_path: str, filepath: str = "", artifact_type: str = "", run
         cursor.execute(query, params)
         row = cursor.fetchone()
         if row:
-            return row["content"]
+            return {"content": row["content"], "metadata_json": row["metadata_json"]}
         return None
 
+
+def update_artifact_metadata(
+    db_path: str,
+    run_id: str,
+    artifact_type: str = "",
+    filepath: str = "",
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Merges `metadata` into the latest matching campaign_artifacts row's metadata_json."""
+    if not db_path or not run_id or not metadata:
+        return False
+    try:
+        with _db(db_path) as conn:
+            cursor = conn.cursor()
+            query = "SELECT id, metadata_json FROM campaign_artifacts WHERE run_id = ?"
+            params: List[Any] = [run_id]
+            if filepath:
+                query += " AND filepath = ?"
+                params.append(filepath)
+            elif artifact_type:
+                query += " AND artifact_type = ?"
+                params.append(artifact_type)
+            query += " ORDER BY id DESC LIMIT 1"
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+            if not row:
+                return False
+            try:
+                existing = json.loads(row["metadata_json"] or "{}")
+                if not isinstance(existing, dict):
+                    existing = {}
+            except ValueError:
+                existing = {}
+            existing.update(metadata)
+            cursor.execute(
+                "UPDATE campaign_artifacts SET metadata_json = ? WHERE id = ?",
+                (json.dumps(existing), row["id"]),
+            )
+            return cursor.rowcount > 0
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return False
+
+
+def record_run(db_path: str, run_id: str, model: str, metadata: Optional[dict] = None) -> bool:
+    """Records which model a run used. Idempotent: a run that is recorded
+    again keeps its first model (a resumed run is the same run). Never
+    raises; this is bookkeeping (INV-6)."""
+    if not db_path or not run_id:
+        return False
+    try:
+        with _db(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS runs (
+                    run_id TEXT PRIMARY KEY,
+                    model TEXT,
+                    started DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    metadata_json TEXT DEFAULT '{}'
+                )
+            """)
+            cursor.execute(
+                "INSERT OR IGNORE INTO runs (run_id, model, metadata_json) VALUES (?, ?, ?)",
+                (str(run_id), str(model or ""), json.dumps(metadata or {})))
+        return True
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return False
+
+
+def run_models(db_path: str) -> Dict[str, str]:
+    """{run_id: model} for every run the database knows the model of.
+    Empty when there is no table yet. Never raises."""
+    if not db_path or not os.path.exists(db_path):
+        return {}
+    try:
+        with _db(db_path) as conn:
+            rows = conn.execute("SELECT run_id, model FROM runs").fetchall()
+        return {str(r[0]): str(r[1] or "") for r in rows if r[0]}
+    except (sqlite3.Error, OSError):
+        return {}
+
+
 def record_learning(db_path: str, run_id: str, category: str, learning: str, tags: Optional[list] = None):
-    """Record a learning entry for cross-pass feedback."""
+    """Record a learning entry for cross-pass feedback, deduplicating within a run."""
     with _db(db_path) as conn:
         cursor = conn.cursor()
         tags_str = json.dumps(tags or [])
+        cursor.execute(
+            "SELECT id FROM learnings WHERE run_id = ? AND category = ? AND learning = ? LIMIT 1",
+            (run_id, category, learning),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            if tags:
+                cursor.execute(
+                    "UPDATE learnings SET tags = ? WHERE id = ?",
+                    (tags_str, existing["id"]),
+                )
+            return
         cursor.execute("""
             INSERT INTO learnings (run_id, category, learning, tags)
             VALUES (?, ?, ?, ?)
@@ -1721,28 +2002,40 @@ def merge_findings(
     primary_id: Optional[int] = None,
     duplicate_ids: Optional[List[int]] = None,
 ) -> int:
-    """Marks duplicate findings as suppressed/merged in the database, safely protecting the primary finding."""
+    """Marks duplicate findings as suppressed/merged in the database, safely protecting the primary finding.
+
+    Every statement is scoped to `run_id` and guarded by the monotonic
+    clause. The ids come from the deduplicator model, which also reads
+    finding text the target wrote, so they are guessable integers an
+    injected model can aim: unscoped, one call from run A merged a
+    patch_verified finding in run B, and the primary restore revived a row
+    the operator had merged on purpose. A primary_id outside the run is
+    ignored rather than trusted.
+    """
     dup_titles = duplicate_titles or []
     dup_ids = duplicate_ids or []
     if not dup_titles and not dup_ids:
         return 0
 
+    run_clause = "run_id = ?" if run_id else "(run_id IS NULL OR run_id = '')"
+    run_params: List[Any] = [run_id] if run_id else []
+    terminal = _terminal_clause_for("duplicate_merged")
+
     with _db(db_path) as conn:
         cursor = conn.cursor()
         merged_count = 0
 
-        # 1. Resolve primary_id if not provided
+        # 1. Resolve primary_id if not provided; a supplied one must be in scope.
+        if primary_id is not None:
+            cursor.execute(f"SELECT 1 FROM findings WHERE id = ? AND {run_clause}",
+                           (primary_id, *run_params))
+            if cursor.fetchone() is None:
+                primary_id = None
         if primary_id is None and primary_title:
-            if run_id:
-                cursor.execute(
-                    "SELECT id FROM findings WHERE title = ? AND run_id = ? ORDER BY id ASC LIMIT 1",
-                    (primary_title, run_id),
-                )
-            else:
-                cursor.execute(
-                    "SELECT id FROM findings WHERE title = ? AND (run_id IS NULL OR run_id = '') ORDER BY id ASC LIMIT 1",
-                    (primary_title,),
-                )
+            cursor.execute(
+                f"SELECT id FROM findings WHERE title = ? AND {run_clause} ORDER BY id ASC LIMIT 1",
+                (primary_title, *run_params),
+            )
             row = cursor.fetchone()
             if row:
                 primary_id = row[0]
@@ -1751,24 +2044,19 @@ def merge_findings(
         for d_id in dup_ids:
             if primary_id is not None and d_id == primary_id:
                 continue
-            cursor.execute("""
+            cursor.execute(f"""
                 UPDATE findings
                 SET status = 'duplicate_merged',
                     description = description || '\n[MERGED: Duplicate of ' || ? || ' - Reason: ' || ? || ']'
-                WHERE id = ? AND id != ?
-            """, (primary_title, reason, d_id, primary_id if primary_id is not None else -1))
+                WHERE id = ? AND id != ? AND {run_clause} {terminal}
+            """, (primary_title, reason, d_id, primary_id if primary_id is not None else -1,
+                  *run_params))
             merged_count += cursor.rowcount
 
         # 3. Merge by duplicate_titles (strictly excluding primary_id)
         for dup in dup_titles:
-            where_clauses = ["title = ?"]
-            params = [primary_title, reason, dup]
-            if run_id:
-                where_clauses.append("run_id = ?")
-                params.append(run_id)
-            else:
-                where_clauses.append("(run_id IS NULL OR run_id = '')")
-
+            where_clauses = ["title = ?", run_clause]
+            params: List[Any] = [primary_title, reason, dup, *run_params]
             if primary_id is not None:
                 where_clauses.append("id != ?")
                 params.append(primary_id)
@@ -1778,15 +2066,17 @@ def merge_findings(
                 UPDATE findings
                 SET status = 'duplicate_merged',
                     description = description || '\n[MERGED: Duplicate of ' || ? || ' - Reason: ' || ? || ']'
-                WHERE {where_str}
+                WHERE {where_str} {terminal}
             """, tuple(params))
             merged_count += cursor.rowcount
 
         # 4. Invariant assertion: primary finding must NEVER remain in duplicate_merged status
+        #    -- for the primary this call just established, in this run.
         if primary_id is not None:
             cursor.execute(
-                "UPDATE findings SET status = 'static_confirmed' WHERE id = ? AND status = 'duplicate_merged'",
-                (primary_id,),
+                f"UPDATE findings SET status = 'static_confirmed' "
+                f"WHERE id = ? AND status = 'duplicate_merged' AND {run_clause}",
+                (primary_id, *run_params),
             )
 
         return merged_count

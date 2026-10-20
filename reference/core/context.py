@@ -1,5 +1,5 @@
 import contextvars
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 @dataclass
@@ -25,6 +25,15 @@ class RunContext:
     # does. Empty means "unknown": canonicalization falls back to the
     # jail-anchored behavior that predates the field (INV-6).
     path_root: str = ""
+    # Operator exclusions (core.exclusions), relative to the target: what the
+    # run does not scan and does not list. Empty means none (INV-6).
+    exclude: tuple = ()
+    # The model this run uses (resolved id). Empty when unknown.
+    model: str = ""
+    # Content-addressed prefix fingerprints by node_id (Harness² runmark).
+    prefix_fingerprints: dict[str, str] = field(default_factory=dict)
+    # Per-file un-windowed read_file call counters for tool-loop steering.
+    read_file_counts: dict[str, int] = field(default_factory=dict)
 
 current_run_context: contextvars.ContextVar[Optional[RunContext]] = contextvars.ContextVar(
     "current_run_context", default=None

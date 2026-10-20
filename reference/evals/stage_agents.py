@@ -77,7 +77,7 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
     (used by research_eval.py for toolset A/B runs). Names still resolve
     through tools.TOOLS, so an override cannot inject an unregistered tool.
     """
-    model_id = model_id or os.environ.get('EVAL_MODEL', 'vertex_ai/gemini-3.7-flash')
+    model_id = model_id or os.environ.get('EVAL_MODEL', 'vertex_ai/gemini-3.8-flash')
     reasoning_effort = reasoning_effort or os.environ.get('EVAL_REASONING_EFFORT', 'low')
     
     _, llm_kwargs = get_llm_kwargs(model_id=model_id, reasoning_effort=reasoning_effort)
@@ -94,6 +94,13 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
             instruction = f"{instruction}\n\n[SKILL GUIDANCE]\n{skill_obj.instructions[:1000]}"
 
     output_schema = STAGE_OUTPUT_SCHEMAS.get(stage_name)
+    after_tool_cb = None
+    if "read_file" in tool_names and (
+        "get_function_boundary" in tool_names or "find_symbol" in tool_names
+    ):
+        from core.graph_loader import _make_after_tool_guard_callback
+
+        after_tool_cb = _make_after_tool_guard_callback(stage_name, tool_names)
 
     return Agent(
         name=stage_name,
@@ -101,6 +108,7 @@ def build_stage_agent(stage_name: str, model_id: str = None, reasoning_effort: s
         instruction=instruction,
         tools=tools_list,
         output_schema=output_schema,
+        after_tool_callback=after_tool_cb,
     )
 
 

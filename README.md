@@ -14,8 +14,25 @@
 > it is a false positive, nor does a successful reproducer guarantee the bug is
 > exploitable in all contexts. Use Mantis responsibly.
 
+> [!WARNING] **The pull request scan is untested.** The GitHub Action in
+> `action/`, the `mantis-pr-scan` and `mantis-knowledge-refresh` workflows under
+> `.github/workflows/`, and `reference/scripts/setup_github_action.sh` have been
+> reviewed and exercised against stubs, but have not yet been run end-to-end
+> against a live project. Do not use the action to gate merges. The status note
+> at the top of
+> [reference/docs/github-action.md](reference/docs/github-action.md) lists what
+> execution has not verified and will be removed when it has.
+
 Mantis is a set of skills along with an ADK reference harness for building
 secure software in the new AI era of software development.
+
+- [`skills/`](skills/) -- the method: the skills an agent loads on demand, from
+  threat modelling through research, review, patching and reporting.
+- [`reference/`](reference/) -- an ADK harness that runs the method as a
+  pipeline, with its own two skills to configure and launch it. Meant to be
+  adapted; works as is.
+- [`action/`](action/) -- a GitHub Action that runs the harness over a pull
+  request (see the warning above).
 
 ## Getting Started
 
@@ -41,8 +58,19 @@ python3 scripts/configure.py --test --probe
 # 4. (Optional) Tell the planner what to hunt for, in plain language (standard pipeline)
 ./run.sh path/to/code --focus "look for IDOR"
 
-# 5. (Optional) Remove spend limits for long unattended runs
-./run.sh path/to/code --no-budget --parallel 32
+# 4b. (Optional) Leave vendored or generated code out of the scan
+./run.sh path/to/code --exclude vendor,testdata --exclude 'third_party/*'
+
+# 4c. (Optional) Keep what Mantis learned in the repository, and read it back next time
+python3 scripts/knowledge.py export --db knowledge.db --repo path/to/code   # writes .mantis/knowledge/
+./run.sh path/to/code --import-knowledge path/to/code/.mantis/knowledge
+
+# 5. (Optional) Set or remove the spend ceiling for a run
+./run.sh path/to/code --max-tokens 2M --cache-discount 1   # hard cap, every token at full price
+./run.sh path/to/code --no-budget --parallel 32            # no ceiling, for long unattended runs
+#    Parallel campaigns share one SQLite database; a writer waits up to
+#    15s x --parallel (min 60s) for the lock. Raise it on slow disks:
+./run.sh path/to/code --parallel 32 --db-timeout 600   # or MANTIS_DB_TIMEOUT=600
 
 # 6. (Optional) Research Graph Synthesis: designs a new agent-graph topology for your objective
 ./run.sh path/to/code --objective "Audit for Server-Side Request Forgery and SSRF in webhook handlers"

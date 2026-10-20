@@ -53,7 +53,7 @@ You can customize the sandbox execution mechanism (`static-only`, `gvisor`,
 python3 scripts/configure.py --sandbox static-only
 
 # Or pass runtime overrides directly to launch:
-./run.sh path/to/code --sandbox static-only --model gemini-3.7-flash
+./run.sh path/to/code --sandbox static-only --model gemini-3.8-flash
 ```
 
 Once you have run it you can add the mantis-advise skill to your favorite coding
@@ -137,10 +137,20 @@ Mantis enforces multi-dimensional ceilings across every campaign:
 - **Wall-Clock Time**: `--max-time 2h` (ISO duration / time format).
 - **Token Budget**: `--token-budget 10M` (raw integer or human-readable format).
 - **Graph Steps & Node Visits**: `--max-steps 500 --max-node-visits 50`.
-- **State Resumption**: `--resume <run_id>` seamlessly resumes paused campaigns
-  from SQLite checkpoints with monotonic status preservation.
+- **State Resumption**: `--resume <run_id>` picks a run back up where it
+  stopped, with monotonic status preservation.
 
 #### Budgets and resumption
+
+**A resumed run scans what it has not finished.** The per-campaign spend ledger
+records which campaigns completed and which failed (a model that returned no
+content, a crashed sandbox). `--resume <run_id>` skips the completed ones and
+scans the rest — the failed campaigns and the ones the run never reached — under
+the same run ID, so findings, dedup and coverage carry on. The run keeps the
+scan mode it was recorded under, so `--scan-mode` need not be repeated.
+`--resume` with no ID resumes the most recent run recorded for the target. A run
+that has nothing left exits immediately; to scan everything again, start a new
+run (or delete the database).
 
 **A resumed run starts from a fresh budget.** `--resume` does not carry forward
 the tokens, steps or elapsed time already spent: the run keeps its findings,
@@ -197,13 +207,13 @@ and *reach* (how much context one question spans), which vary independently.
 
 ```bash
 # Ask one researcher about every file, then dedupe downstream.
-python3 main.py /path/to/repo --scan-mode file-by-file
+./run.sh /path/to/repo --scan-mode file-by-file
 
 # Go straight at composite defects, with no per-file pass first.
-python3 main.py /path/to/repo --scan-mode cross-functional
+./run.sh /path/to/repo --scan-mode cross-functional
 
 # Skip the work-plan confirmation (CI, cron, nohup).
-python3 main.py /path/to/repo --scan-mode file-by-file --yes
+./run.sh /path/to/repo --scan-mode file-by-file --yes
 ```
 
 Running `file-by-file` first gives a later `cross-functional` pass real evidence
@@ -215,6 +225,83 @@ still be run alone with an explicit `--scan-mode`. Any plan of 50 campaigns or
 more asks for confirmation on an interactive terminal; the plan is printed
 either way, so a CI log records what the run committed to. The superseded
 spellings `file-sweep` and `slices` are still accepted.
+
+### Leaving parts of the target out
+
+`--exclude` keeps matching paths out of the scan. Patterns are relative to the
+target: a bare name (`vendor`, `testdata`) matches a directory or file of that
+name at any depth, a pattern with a slash (`third_party/*`, `src/gen/*.pb.go`)
+matches the relative path, and `fnmatch` wildcards apply. The flag repeats and
+takes comma-separated lists; a workflow can carry the same list under
+`config.exclude`, and the flag adds to it.
+
+```bash
+./run.sh /path/to/repo --exclude vendor,testdata --exclude 'third_party/*'
+```
+
+Exclusion governs what is scanned: excluded files are not swept in
+`file-by-file`, not ranked into subsystems in `cross-functional`, and not shown
+when the agent lists the tree in `whole`. They stay readable and indexed, so a
+scanned function that calls into an excluded directory can still be followed
+there, and a caller in an excluded test directory is still a caller. The run
+states what it excluded and how many files remain in scope.
+
+### Keeping what Mantis learned in the repository
+
+Everything a run learns about a codebase — its findings and their status, the
+threat model and architecture it drew, what it has covered, and what it noticed
+about the code's habits — lives in the knowledge database, scoped to runs. That
+is the right shape for a run and the wrong shape for a repository: nobody opens
+the database, nothing survives a fresh checkout, and a reviewer cannot see a
+claim change.
+
+`scripts/knowledge.py export` writes the same knowledge as text under
+`.mantis/knowledge/`, one record per line, sorted, so it can be committed and a
+re-export after the next run diffs to exactly what changed:
+
+```bash
+./run.sh /path/to/repo
+python3 scripts/knowledge.py export --db knowledge.db --repo /path/to/repo
+git -C /path/to/repo add .mantis/knowledge && git -C /path/to/repo commit -m "Mantis: refresh knowledge"
+```
+
+The next run reads it back before it decides what to scan:
+
+```bash
+./run.sh /path/to/repo --import-knowledge /path/to/repo/.mantis/knowledge
+```
+
+Imported findings keep their lineage ids and statuses, so a re-scan matches what
+it already knows rather than reporting it again and a suppressed finding stays
+suppressed; coverage feeds `auto` mode, which sweeps only what has never been
+covered; and the threat model and architecture are found by the run's own tools,
+so the architect and threat modeler refine rather than rebuild. `.mantis/`
+itself is never a scan target.
+
+Export is a deliberate step after a scan rather than something the scan does:
+the pipeline never writes into the target it audits. Import is explicit for the
+same reason in reverse: the files sit in the checkout, and whether to trust them
+is the operator's call, not the tool's. Everything imported is treated as data —
+scrubbed, bounded, and validated — and a file the importer cannot read costs the
+run that part of its memory, never the run.
+
+Checked in, the knowledge is versioned, diffable, and reviewed like any other
+claim about the system: "Mantis thinks `/admin/export` sits behind the auth
+boundary; it does not" is a review comment on `threat_model.md`, and a pull
+request that marks a finding suppressed is a change a person approves. A
+scheduled full scan that opens a pull request with the refreshed export is the
+loop that keeps it current; `docs/github-action.md` describes the incremental
+version, which scans only what landed and sweeps uncovered files within a
+budget.
+
+One status exists for this loop: **archived**. A refresh that rescans a file
+whose change rewrote the lines a known finding cited, and does not find the
+lineage again, archives the finding rather than closing it or leaving it open.
+Archived findings do not gate, are shown as notices when their file is touched,
+are recalled first by the next run on that area ("found here before; the code
+changed since"), and reopen on any later report of the same lineage. The name is
+the hint: to a person or an agent reading the knowledge, an archived entry is
+the place most worth a second look.
 
 ## Evidence Sources
 

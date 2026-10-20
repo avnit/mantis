@@ -1,9 +1,11 @@
 import functools
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -22,6 +24,15 @@ LiteLlm = ResilientLiteLlm
 from core.environments import ENVIRONMENTS, get_shared_proxy_environment
 from core.sandbox import SANDBOXES
 from core.llm_gateway import UNTRUSTED_CODE_AUDIT_GUARD
+
+# What a node may stamp on the findings in its scope when it completes. A
+# strict subset of the status vocabulary: `patch_verified` is the harness's
+# highest-assurance word, earned only through the re-attack flow, and the
+# MCP change gate treats it as closed -- a workflow that stamped it would
+# silence every finding in the campaign; `reported` would reopen dismissals.
+# Enforced here, where the stamp callback is attached, so a hand-written
+# workflow, a synthesized graph, and a persisted recipe all meet the same gate.
+NODE_STAMP_STATUSES = frozenset({"static_confirmed", "dynamic_confirmed"})
 from tools import TOOLS
 
 DEFAULT_SEED_PROMPT = "Initial Task Input: Evaluate {filepath}"
@@ -101,6 +112,9 @@ class GlobalConfig(_Base):
     compaction_event_retention: int = Field(default=50, ge=0)
     enable_context_cache: bool = True
     budget: Optional[dict[str, Any]] = None
+    # Paths under the target that are not scanned: patterns relative to the
+    # target, see core.exclusions. A list, or one comma-separated string.
+    exclude: Optional[list[str] | str] = None
 
     @field_validator("seed_prompt")
     @classmethod
@@ -462,8 +476,151 @@ _PREFIX_REUSE_ARTIFACTS = {
 # importing main from this module would be circular. A test pins the two equal.
 _SCAN_MODE_CROSS_FUNCTIONAL = "cross-functional"
 
+# Shared Harness²-inspired tool-loop guard constants and helpers (c8).
+ABORT_GUARD_MIN_TOOL_CALLS = 8
+ABORT_GUARD_PROMPT = (
+    "Your previous reply ended the run without doing the audit: no findings "
+    "were reported and no tools were called. Do not answer with prose only. "
+    "Tool calls must go through the function-calling interface -- writing "
+    "one out as text, like 'call:api:read_file{...}', does nothing. "
+    "Resume now: call list_files('app'), read the source, and report every "
+    "confirmed vulnerability via report_findings before you finish."
+)
+PSEUDO_TOOL_CALL_RE = re.compile(
+    r"(?:\bcall:\w+:\w+\s*\{|<tool_call>|<function=|<minimax:tool_call|```tool_call)",
+    re.IGNORECASE,
+)
+READ_FILE_REPEAT_THRESHOLD = 3
 
-def _make_prefix_reuse_callbacks(node_id: str):
+
+def count_event_tool_calls(event: Any) -> int:
+    """Function calls carried by one ADK event. Never raises."""
+    try:
+        parts = getattr(getattr(event, "content", None), "parts", None) or []
+        return sum(1 for part in parts if getattr(part, "function_call", None))
+    except Exception:
+        return 0
+
+
+def event_has_pseudo_tool_call(event: Any) -> bool:
+    """True when a text part spells out a tool call instead of making one. Never raises."""
+    try:
+        parts = getattr(getattr(event, "content", None), "parts", None) or []
+        if any(
+            PSEUDO_TOOL_CALL_RE.search(getattr(part, "text", None) or "")
+            for part in parts
+        ):
+            return True
+        output = getattr(event, "output", None)
+        return bool(isinstance(output, str) and PSEUDO_TOOL_CALL_RE.search(output))
+    except Exception:
+        return False
+
+
+def should_rearm_run(
+    findings_count: int,
+    tool_calls: int,
+    rearms_used: int = 0,
+    pseudo_tool_call: bool = False,
+) -> bool:
+    """True only for the first run that ends with nothing reported and
+    nearly nothing attempted -- or that ended on a tool call written as
+    text, which no tool-count threshold can tell from a deliberate stop."""
+    return (
+        rearms_used == 0
+        and findings_count == 0
+        and (tool_calls < ABORT_GUARD_MIN_TOOL_CALLS or pseudo_tool_call)
+    )
+
+
+def compute_prefix_fingerprint(
+    node_id: str,
+    instruction: str = "",
+    tools: Sequence[str] = (),
+    model: str = "",
+    snapshot_id: str = "",
+) -> str:
+    """Computes a content-addressed fingerprint (Harness² runmark) for a stage."""
+    payload = json.dumps(
+        {
+            "instruction": instruction,
+            "model": model,
+            "node_id": node_id,
+            "snapshot_id": snapshot_id,
+            "tools": sorted(str(t) for t in tools),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _make_after_tool_guard_callback(node_id: str, tool_names: Sequence[str] = ()):
+    """Steers agents away from repeated un-windowed read_file calls on the same file."""
+    has_structural_nav = (
+        "get_function_boundary" in tool_names or "find_symbol" in tool_names
+    )
+    local_counts: dict[str, int] = {}
+
+    def _after_tool(
+        tool: Any,
+        args: dict[str, Any],
+        tool_context: Any,
+        tool_response: Any,
+    ) -> Any:
+        if not has_structural_nav:
+            return None
+        tool_name = getattr(tool, "name", None) or getattr(tool, "__name__", "")
+        if tool_name != "read_file" or not isinstance(args, dict):
+            return None
+        # read_file's bounds default to 0 (= whole file) and models routinely
+        # echo declared defaults, so `start_line=0, end_line=0` is an
+        # un-windowed read too. Only a positive bound counts as windowed.
+        if args.get("start_line") or args.get("end_line"):
+            return None
+        filepath = str(args.get("filepath") or args.get("path") or "").strip()
+        if not filepath:
+            return None
+
+        counts = local_counts
+        try:
+            from core.context import current_run_context
+
+            ctx = current_run_context.get()
+            if ctx is not None and isinstance(getattr(ctx, "read_file_counts", None), dict):
+                counts = ctx.read_file_counts
+        except Exception:
+            pass
+
+        key = f"{node_id}:{filepath}"
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] < READ_FILE_REPEAT_THRESHOLD:
+            return None
+
+        # The suggested calls must match the real tool signatures
+        # (tools/structural_tools.py): get_function_boundary(filepath, line)
+        # and find_symbol(name). A hint that names a parameter the tool does
+        # not have sends an already-stuck model into a validation error.
+        hint = (
+            f"[HARNESS STEERING HINT: You have read '{filepath}' {counts[key]} times "
+            f"without line bounds in stage '{node_id}'. Prefer "
+            f"find_symbol(name='<function or class>') to locate a definition, "
+            f"get_function_boundary(filepath='{filepath}', line=<line number>) to get "
+            f"the enclosing function's exact span, or pass start_line/end_line to "
+            f"read_file.]"
+        )
+        if isinstance(tool_response, str):
+            return f"{tool_response}\n\n{hint}"
+        if isinstance(tool_response, dict) and isinstance(tool_response.get("result"), str):
+            updated = dict(tool_response)
+            updated["result"] = f"{tool_response['result']}\n\n{hint}"
+            return updated
+        return None
+
+    return _after_tool
+
+
+def _make_prefix_reuse_callbacks(node_id: str, fingerprint: str = ""):
     """Before/after callbacks that let a repo-scope prefix stage reuse itself.
 
     In cross-functional mode every campaign shares the repository jail, and the
@@ -475,9 +632,10 @@ def _make_prefix_reuse_callbacks(node_id: str):
 
       * the run is cross-functional. Per-campaign jails make reuse wrong, so
         file-by-file and unknown modes always re-run;
-      * this process already ran the stage to completion for this run_id.
-        Process-local on purpose: a resumed run re-derives against the
-        resynced checkout instead of trusting a pre-restart artifact;
+      * this process already ran the stage to completion for this (run_id,
+        snapshot_id, model, prefix_fingerprint) tuple. Process-local on purpose:
+        a resumed run or mutated stage config re-derives against the checkout
+        instead of trusting a pre-restart or stale artifact;
       * the stage's artifact row actually exists in the database.
 
     Everything else -- missing context, missing artifact, any exception --
@@ -487,6 +645,19 @@ def _make_prefix_reuse_callbacks(node_id: str):
     on every campaign after the first.
     """
     completed_runs: set[str] = set()
+    completed_keys: set[tuple[str, str, str, str]] = set()
+
+    def _run_key(ctx: Any) -> tuple[str, str, str, str]:
+        fp_map = getattr(ctx, "prefix_fingerprints", None) or {}
+        ctx_fp = fp_map.get(node_id, "") if isinstance(fp_map, dict) else ""
+        default_fp = getattr(_before, "_default_fingerprint", "") or fingerprint
+        eff_fp = ctx_fp or default_fp
+        return (
+            str(ctx.run_id),
+            str(getattr(ctx, "snapshot_id", "") or ""),
+            str(getattr(ctx, "model", "") or ""),
+            str(eff_fp),
+        )
 
     def _before(callback_context=None):
         try:
@@ -499,16 +670,38 @@ def _make_prefix_reuse_callbacks(node_id: str):
                 return None
             if ctx.run_id not in completed_runs:
                 return None
-            from core.database import read_artifact
+            key = _run_key(ctx)
+            if key not in completed_keys:
+                return None
+            from core.database import read_artifact, read_artifact_record
             from core.paths import resolve_db_path
 
+            resolved_db = resolve_db_path(ctx.db_path)
             artifact = read_artifact(
-                resolve_db_path(ctx.db_path),
+                resolved_db,
                 artifact_type=_PREFIX_REUSE_ARTIFACTS[node_id],
                 run_id=ctx.run_id,
             )
             if not artifact:
                 return None
+            rec = read_artifact_record(
+                resolved_db,
+                artifact_type=_PREFIX_REUSE_ARTIFACTS[node_id],
+                run_id=ctx.run_id,
+            )
+            if rec and rec.get("metadata_json"):
+                try:
+                    meta = json.loads(rec["metadata_json"])
+                except ValueError:
+                    meta = {}
+                if isinstance(meta, dict) and meta.get("prefix_fingerprint"):
+                    stored_mark = (
+                        str(meta.get("snapshot_id", "")),
+                        str(meta.get("model", "")),
+                        str(meta.get("prefix_fingerprint", "")),
+                    )
+                    if stored_mark != (key[1], key[2], key[3]):
+                        return None
             return types.Content(
                 role="model",
                 parts=[types.Part(text=(
@@ -535,11 +728,110 @@ def _make_prefix_reuse_callbacks(node_id: str):
                 and getattr(ctx, "scan_mode", "") == _SCAN_MODE_CROSS_FUNCTIONAL
             ):
                 completed_runs.add(ctx.run_id)
+                key = _run_key(ctx)
+                completed_keys.add(key)
+                if ctx.db_path:
+                    from core.database import update_artifact_metadata
+                    from core.paths import resolve_db_path
+
+                    update_artifact_metadata(
+                        resolve_db_path(ctx.db_path),
+                        ctx.run_id,
+                        artifact_type=_PREFIX_REUSE_ARTIFACTS[node_id],
+                        metadata={
+                            "snapshot_id": key[1],
+                            "model": key[2],
+                            "prefix_fingerprint": key[3],
+                        },
+                    )
         except Exception:
             pass
         return None
 
     return _before, _after
+
+
+def _make_stage_experience_before_model_callback(node_id: str):
+    """Injects stage-targeted <experience> lessons into the agent's LlmRequest."""
+    stage_key = "researcher" if node_id.startswith("researcher") else node_id
+    cached_blocks: dict[tuple[str, str, str], str] = {}
+
+    def _before_model(callback_context: Any = None, llm_request: Any = None) -> None:
+        try:
+            if llm_request is None:
+                return None
+            sys_inst = str(
+                getattr(getattr(llm_request, "config", None), "system_instruction", "") or ""
+            )
+            if "[STAGE EXPERIENCE" in sys_inst:
+                return None
+            from core.context import current_run_context
+            from core.paths import resolve_db_path
+
+            ctx = current_run_context.get()
+            if ctx is None or not ctx.db_path:
+                return None
+            resolved_db = resolve_db_path(ctx.db_path)
+            if not os.path.exists(resolved_db):
+                return None
+            target_file = str(getattr(ctx, "target_file", "") or "")
+            cache_key = (
+                resolved_db,
+                str(getattr(ctx, "run_id", "") or ""),
+                target_file,
+            )
+            if cache_key not in cached_blocks:
+                from core.memory import render_stage_learnings_for_agent
+
+                cached_blocks[cache_key] = render_stage_learnings_for_agent(
+                    resolved_db,
+                    stage_key,
+                    target=target_file,
+                )
+            block = cached_blocks[cache_key]
+            if not block:
+                return None
+            if hasattr(llm_request, "append_instructions"):
+                llm_request.append_instructions([block])
+        except Exception:
+            pass
+        return None
+
+    return _before_model
+
+
+def _make_reflector_after_model_callback(node_id: str):
+    """Parses and persists <edits> and <experience> blocks emitted by reflector."""
+
+    def _after_model(callback_context: Any = None, llm_response: Any = None) -> None:
+        try:
+            if llm_response is None:
+                return None
+            parts = getattr(getattr(llm_response, "content", None), "parts", None) or []
+            text = "\n".join(
+                str(getattr(p, "text", "") or "")
+                for p in parts
+                if getattr(p, "text", None) and not getattr(p, "thought", False)
+            )
+            if not text or ("<edits>" not in text.lower() and "<experience>" not in text.lower()):
+                return None
+            from core.context import current_run_context
+            from core.memory import record_reflection_output
+            from core.paths import resolve_db_path
+
+            ctx = current_run_context.get()
+            if ctx is None or not ctx.db_path or not ctx.run_id:
+                return None
+            record_reflection_output(
+                resolve_db_path(ctx.db_path),
+                ctx.run_id,
+                text,
+            )
+        except Exception:
+            pass
+        return None
+
+    return _after_model
 
 
 def create_findings_gate(node_id: str):
@@ -1063,6 +1355,29 @@ def load_raw_workflow_with_overlay(json_path: str, load_local: bool = True) -> t
     return raw_json, base_dir
 
 
+class _BarrierAgent(adk.Agent):
+    """An agent node that waits for ALL of its predecessors before running.
+
+    ADK's Workflow consults the private ``_requires_all_predecessors`` property
+    (the same one ``google.adk.workflow.JoinNode`` sets) to decide whether a
+    node fires on the first incoming trigger or buffers until every
+    predecessor has COMPLETED. Fan-in nodes that are reached only by
+    unconditional edges (two parallel researcher arms converging at dedupe)
+    use this class so the join happens once instead of once per arm.
+
+    Known consequence: if any predecessor fails, the barrier never fires and
+    nothing downstream of it runs. That matches ADK's JoinNode semantics.
+
+    Defined at module level on purpose: tests spy on ``adk.Agent`` by swapping
+    it for a plain function, and a class statement inside the loader would
+    then try to use that function as a metaclass.
+    """
+
+    @property
+    def _requires_all_predecessors(self) -> bool:
+        return True
+
+
 def load_workflow_from_json(
     json_path: str,
     model_override: Optional[str] = None,
@@ -1127,6 +1442,19 @@ def load_workflow_from_json(
         errors.append(f"Custom tools: {e}")
 
     resolvable_tools = {**TOOLS, **custom_tools}
+
+    prefix_fingerprints: dict[str, str] = {}
+    unconditional_in_edges: dict[str, int] = {}
+    conditional_in_edges: dict[str, int] = {}
+    for edge_cfg in spec.edges:
+        if edge_cfg.on is None:
+            unconditional_in_edges[edge_cfg.to_node] = (
+                unconditional_in_edges.get(edge_cfg.to_node, 0) + 1
+            )
+        else:
+            conditional_in_edges[edge_cfg.to_node] = (
+                conditional_in_edges.get(edge_cfg.to_node, 0) + 1
+            )
 
     nodes = {}
     node_specs = {}
@@ -1327,7 +1655,21 @@ def load_workflow_from_json(
             else:
                 agent_kwargs["include_contents"] = "none"
 
-            if node_cfg.on_enter_status:
+            stamp_status = str(node_cfg.on_enter_status or "").strip().lower()
+            if stamp_status and stamp_status not in NODE_STAMP_STATUSES:
+                # A workflow file -- hand-written, synthesized, or recipe
+                # persisted by an earlier run -- may only stamp the two
+                # coverage statuses. patch_verified is earned through the
+                # re-attack flow and closes findings at the MCP gate;
+                # reported would reopen dismissals. Refuse rather than trust.
+                print(
+                    f"[graph_loader] node '{node_id}': on_enter_status "
+                    f"'{node_cfg.on_enter_status}' is not a status a node may stamp "
+                    f"(allowed: {sorted(NODE_STAMP_STATUSES)}); ignoring it.",
+                    file=sys.stderr,
+                )
+                stamp_status = ""
+            if stamp_status:
                 # P4: coverage stamps fire on successful node COMPLETION, not
                 # entry. main.py used to stamp the moment a node's name first
                 # appeared in the event stream -- i.e. before the node did any
@@ -1342,7 +1684,7 @@ def load_workflow_from_json(
                 # on_enter_status map exported to main.py is emptied below so
                 # the old entry-time stamp cannot double-fire.
                 agent_kwargs["after_agent_callback"] = _make_completion_stamp_callback(
-                    node_id, node_cfg.on_enter_status
+                    node_id, stamp_status
                 )
 
             if node_id in _PREFIX_REUSE_ARTIFACTS and not node_cfg.on_enter_status:
@@ -1350,11 +1692,42 @@ def load_workflow_from_json(
                 # _make_prefix_reuse_callbacks). Attached only when the node
                 # carries no completion stamp, so a future on_enter_status on
                 # these nodes disables reuse rather than displacing the stamp.
+                prefix_fingerprints[node_id] = compute_prefix_fingerprint(
+                    node_id,
+                    instruction=instruction,
+                    tools=node_cfg.tools,
+                    model=str(node_cfg.model or spec.config.default_model or DEFAULT_MODEL),
+                )
                 before_reuse, after_reuse = _make_prefix_reuse_callbacks(node_id)
+                before_reuse._default_fingerprint = prefix_fingerprints[node_id]
                 agent_kwargs["before_agent_callback"] = before_reuse
                 agent_kwargs["after_agent_callback"] = after_reuse
 
-            agent = adk.Agent(**agent_kwargs)
+            if "read_file" in node_cfg.tools and (
+                "get_function_boundary" in node_cfg.tools
+                or "find_symbol" in node_cfg.tools
+            ):
+                agent_kwargs["after_tool_callback"] = _make_after_tool_guard_callback(
+                    node_id, node_cfg.tools
+                )
+
+            agent_kwargs["before_model_callback"] = (
+                _make_stage_experience_before_model_callback(node_id)
+            )
+            if node_id == "reflector" or (
+                node_cfg.skill and "mantis-reflect" in node_cfg.skill
+            ):
+                agent_kwargs["after_model_callback"] = (
+                    _make_reflector_after_model_callback(node_id)
+                )
+
+            agent_cls = (
+                _BarrierAgent
+                if unconditional_in_edges.get(node_id, 0) > 1
+                and conditional_in_edges.get(node_id, 0) == 0
+                else adk.Agent
+            )
+            agent = agent_cls(**agent_kwargs)
             node_retry = (
                 RetryConfig(
                     max_attempts=spec.config.retry_attempts,
@@ -1480,6 +1853,7 @@ def load_workflow_from_json(
     # so the map it receives must be empty. The key itself stays present
     # because it is part of the config contract main.py reads unconditionally.
     cfg["on_enter_status"] = {}
+    cfg["prefix_fingerprints"] = prefix_fingerprints
     if spec.budget:
         cfg["budget"] = spec.budget
     elif "budget" in raw_json and isinstance(raw_json["budget"], dict):

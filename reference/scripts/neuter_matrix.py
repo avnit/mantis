@@ -93,8 +93,8 @@ SCENARIOS = {
          "    db_path = resolve_db_path(db_path)",
          "    pass  # NEUTERED"),
         ("scripts/advise.py",
-         "    conn = sqlite3.connect(resolve_db_path(db_path))",
-         "    conn = sqlite3.connect(db_path)  # NEUTERED"),
+         "    conn = _connect(resolve_db_path(db_path))",
+         "    conn = _connect(db_path)  # NEUTERED"),
     ],
     "r3_revert_okf_export_sanitizer": [
         ("core/database.py",
@@ -448,7 +448,7 @@ SCENARIOS = {
     # ---- Campaign cost model / scan sizing ----
     "scan_revert_virgin_sweep": [
         ('main.py',
-         '                uncovered = uncovered_files(db_path, discovered_files)',
+         '                uncovered = uncovered_files(db_path, discovered_files, model=run_model)',
          '                uncovered = None  # NEUTERED: coverage gaps are silently skipped, never swept'),
     ],
     "cost_revert_coverage_failsafe": [
@@ -658,8 +658,8 @@ SCENARIOS = {
     ],
     'tools_revert_argument_quoting': [
         ('core/custom_tools.py',
-         '        rendered = command.replace("{filepath}", shlex.quote(str(filepath or "")))',
-         '        rendered = command.replace("{filepath}", str(filepath or ""))  # NEUTERED: model-chosen path interpolated verbatim into a shell command'),
+         '        rendered = command.replace("{filepath}", shlex.quote(fp))',
+         '        rendered = command.replace("{filepath}", fp)  # NEUTERED: model-chosen path interpolated verbatim into a shell command'),
     ],
     'tools_revert_registry_wiring': [
         ('core/graph_loader.py',

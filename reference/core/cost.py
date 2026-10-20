@@ -64,6 +64,15 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+
+def _connect(db_path: str) -> sqlite3.Connection:
+    """Knowledge-database connection with the shared busy timeout and journal
+    settings (core.database.connect); imported lazily to keep module import
+    order free of cycles."""
+    from core.database import connect
+
+    return connect(db_path)
+
 # Characters per token. Matches core.config._CHARS_PER_TOKEN and the estimate at
 # main.py's token fallback, deliberately: a second, different constant for the same
 # quantity would make two parts of the system disagree about what a token costs.
@@ -176,8 +185,25 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
     )
 
 
-def uncovered_files(db_path: str, files) -> Optional[list]:
+def _row_failed(metadata_json: Any) -> bool:
+    try:
+        meta = json.loads(metadata_json or "{}")
+    except (TypeError, ValueError):
+        return False
+    return isinstance(meta, dict) and bool(meta.get("failed"))
+
+
+def uncovered_files(db_path: str, files, model: str = "") -> Optional[list]:
     """The subset of `files` no recorded campaign has ever covered.
+
+    With `model` given, covered means covered BY THAT MODEL: a file another
+    model is known to have scanned is still uncovered for this one.
+    Knowledge built by more than one model needs each to see every file,
+    and the models differ in what they find. A campaign whose model is
+    unknown (recorded before runs were, or imported from an export that
+    did not say) counts as coverage for every model, as it always did:
+    turning on provenance must not make an existing knowledge base re-sweep
+    itself.
 
     A file counts as covered when some completed campaign's target was the
     file itself or an ancestor directory of it: scanning `repo/lib` covers
@@ -186,6 +212,12 @@ def uncovered_files(db_path: str, files) -> Optional[list]:
     seen": a codebase whose `lib/` was scanned last month still has every
     file outside `lib/` uncovered, and skipping those silently is exactly
     the hole the caller uses this to close.
+
+    A campaign that FAILED does not cover anything. Its row stays in the
+    ledger (it ran the graph and cost real tokens, which the cost estimate
+    wants to know), but a crashed scan looked at nothing a later run should
+    trust; counting it would make `auto` skip the file forever and would let
+    a change gate treat it as audited.
 
     Returns None when there is no ledger to consult or it cannot be read.
     The distinction is deliberate and load-bearing: a MISSING ledger (no
@@ -201,12 +233,23 @@ def uncovered_files(db_path: str, files) -> Optional[list]:
     try:
         if not os.path.exists(db_path):
             return all_files
-        conn = sqlite3.connect(db_path)
+        conn = _connect(db_path)
         try:
             try:
-                rows = conn.execute(
-                    "SELECT DISTINCT target FROM campaign_spend WHERE target IS NOT NULL"
-                ).fetchall()
+                has_runs = model and conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'").fetchone()
+                if has_runs:
+                    # Rows of this model, and rows of no known model.
+                    rows = conn.execute(
+                        "SELECT s.target, s.metadata_json FROM campaign_spend s "
+                        "LEFT JOIN runs r ON r.run_id = s.run_id "
+                        "WHERE s.target IS NOT NULL AND (r.model = ? OR r.model IS NULL OR r.model = '')",
+                        (str(model),)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT target, metadata_json FROM campaign_spend WHERE target IS NOT NULL"
+                    ).fetchall()
             except sqlite3.OperationalError as exc:
                 if "no such table" in str(exc).lower():
                     return all_files  # Ledger never written: genuine first run.
@@ -214,9 +257,9 @@ def uncovered_files(db_path: str, files) -> Optional[list]:
         finally:
             conn.close()
         targets = set()
-        for (target,) in rows:
+        for target, metadata_json in rows:
             t = str(target or "").rstrip("/")
-            if t:
+            if t and not _row_failed(metadata_json):
                 targets.add(t)
         out = []
         for path in all_files:
@@ -235,6 +278,117 @@ def uncovered_files(db_path: str, files) -> Optional[list]:
         return out
     except Exception:
         return None
+
+
+def run_ledger(db_path: str, run_id: str) -> Optional[dict]:
+    """What one run's campaigns did, as `{target: {"failed": bool}}`, the
+    latest row per target winning (a retried campaign supersedes its failure).
+
+    Returns None when the ledger cannot be read, `{}` when the run has no
+    rows: a run that paused inside its first campaign recorded nothing, and
+    resuming it means scanning everything, which is what an empty answer
+    tells the caller. Never raises.
+    """
+    if not db_path or not run_id:
+        return None
+    try:
+        if not os.path.exists(db_path):
+            return {}
+        conn = _connect(db_path)
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT target, metadata_json FROM campaign_spend "
+                    "WHERE run_id = ? AND target IS NOT NULL ORDER BY id ASC",
+                    (str(run_id),),
+                ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    return {}
+                raise
+        finally:
+            conn.close()
+        out: dict = {}
+        for target, metadata_json in rows:
+            t = str(target or "").rstrip("/")
+            if t:
+                out[t] = {"failed": _row_failed(metadata_json)}
+        return out
+    except Exception:
+        return None
+
+
+def run_scan_mode(db_path: str, run_id: str) -> str:
+    """The scan mode a run's campaigns were recorded under, '' if unknown.
+
+    The mode is not stored with the run, but every ledger row carries it,
+    and a resumed run must plan the way the original did: a file-by-file
+    sweep picked up without the flag would otherwise be re-resolved as
+    `auto`, which plans one whole-target campaign for a small directory
+    and so reruns the wrong thing. Latest row wins. Never raises.
+    """
+    if not db_path or not run_id:
+        return ""
+    try:
+        if not os.path.exists(db_path):
+            return ""
+        conn = _connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT scan_mode FROM campaign_spend WHERE run_id = ? "
+                "AND scan_mode IS NOT NULL AND scan_mode != '' ORDER BY id DESC LIMIT 1",
+                (str(run_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+        return str(row[0]) if row else ""
+    except Exception:
+        return ""
+
+
+def latest_run_id(db_path: str, target: str = "") -> str:
+    """The most recent run recorded in this database, preferring runs whose
+    ledger rows fall under `target` so `--resume` in one repository does not
+    pick up a run over another. Falls back to the findings table for a run
+    that never completed a campaign. '' when there is nothing to resume.
+    Never raises.
+    """
+    if not db_path or not os.path.exists(db_path):
+        return ""
+    root = os.path.realpath(target) if target else ""
+    try:
+        conn = _connect(db_path)
+        try:
+            candidates: list = []
+            for sql in (
+                "SELECT run_id, target, MAX(timestamp) AS ts FROM campaign_spend "
+                "WHERE run_id IS NOT NULL AND run_id != '' GROUP BY run_id",
+                "SELECT run_id, '' AS target, MAX(timestamp) AS ts FROM findings "
+                "WHERE run_id IS NOT NULL AND run_id != '' GROUP BY run_id",
+            ):
+                try:
+                    candidates += [tuple(r) for r in conn.execute(sql).fetchall()]
+                except sqlite3.OperationalError:
+                    continue
+        finally:
+            conn.close()
+    except Exception:
+        return ""
+    if not candidates:
+        return ""
+
+    def under_root(t: str) -> bool:
+        if not root or not t:
+            return not root
+        try:
+            rt = os.path.realpath(t)
+            return rt == root or os.path.commonpath([rt, root]) == root
+        except (ValueError, OSError):
+            return False
+
+    scoped = [c for c in candidates if under_root(str(c[1] or ""))] or candidates
+    scoped.sort(key=lambda c: str(c[2] or ""), reverse=True)
+    return str(scoped[0][0])
 
 
 def record_spend(
@@ -260,7 +414,7 @@ def record_spend(
         # closing(), not a bare `with`: sqlite3's connection context manager is a
         # TRANSACTION manager that commits or rolls back and leaves the handle open.
         # One leaked descriptor per campaign is 462,079 of them on a chromium sweep.
-        conn = sqlite3.connect(db_path, timeout=30.0)
+        conn = _connect(db_path)
         with conn:
             _ensure_table(conn)
             conn.execute(
@@ -309,7 +463,7 @@ def observed_campaign_cost(
     rows: list[Any] = []
     conn = None
     try:
-        conn = sqlite3.connect(db_path, timeout=30.0)
+        conn = _connect(db_path)
         with conn:
             _ensure_table(conn)
             cur = conn.cursor()

@@ -173,13 +173,13 @@ except Exception:  # pragma: no cover - only when pydantic itself is absent
     FindingVerdict = None
     ExtendedReviewVerdict = None
 
-DEFAULT_MODEL = "vertex_ai/gemini-3.7-flash"
+DEFAULT_MODEL = "vertex_ai/gemini-3.8-flash"
 SUPPORTED_SANDBOXES = ("static-only", "static", "gvisor", "microsandbox", "gce")
 RECOMMENDED_MODELS = (
-    "gemini-3.7-flash",
+    "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
     "claude-opus-5",
-    "vertex_ai/gemini-3.7-flash",
+    "vertex_ai/gemini-3.8-flash",
     "vertex_ai/gemini-3.5-flash-lite",
     "vertex_ai/claude-opus-5",
     "vertex_ai/zai_org/glm-5.2-maas",
@@ -278,6 +278,10 @@ def is_retryable_llm_error(e: Exception) -> bool:
     if is_auth_error(e) or isinstance(e, (MantisAuthError, PermissionError, FileNotFoundError)):
         return False
     if is_rate_limit_error(e):
+        return True
+    # An empty STOP turn is retried like a 429: same backoff, same patience.
+    # Its cost is metered where it is raised (see MantisEmptyResponseError).
+    if isinstance(e, MantisEmptyResponseError):
         return True
     if isinstance(e, json.decoder.JSONDecodeError):
         return True
@@ -393,6 +397,14 @@ class MantisAuthError(RuntimeError):
         self.original_exception = original_exception
 
 
+# Process exit status for a MantisAuthError. Distinct from 1 (a scan that
+# failed) and 2 (a budget pause) so a caller can recognize "the provider
+# rejected the credentials" from the status alone. Log text is not a safe
+# channel for that: the pipeline echoes file names and file contents that the
+# code under audit controls, so any marker string can be forged there.
+EXIT_AUTH = 4
+
+
 class MantisStreamingTruncationError(RuntimeError):
     """Raised when streaming tool call arguments are truncated mid-stream by output limits or premature chunk completion."""
     pass
@@ -414,6 +426,60 @@ class MantisStreamInterruptedError(RuntimeError):
         super().__init__(message)
         self.chunks_yielded = chunks_yielded
         self.original_exception = original_exception
+
+
+class MantisEmptyResponseError(RuntimeError):
+    """A non-streaming turn finished with STOP and no parts: no text, no tool
+    call, no error code. The model billed the prompt and said nothing.
+
+    Left alone, ADK reports the turn as MODEL_RETURNED_NO_CONTENT, the node
+    moves on with nothing, and the whole campaign is marked failed over one
+    empty sample. Raised inside the model layer instead, so the turn goes
+    back through the same backoff loop as a 429. The difference from a 429
+    is that each attempt was a billed prompt, so the response's usage is
+    metered against the run budget before this is raised: the token ceiling
+    bounds the worst case, as it bounds everything else. Past the patience
+    window the empty response is passed on unchanged, and the pipeline sees
+    exactly what it saw before.
+    """
+
+    def __init__(self, message: str, response: Any = None):
+        super().__init__(message)
+        self.response = response
+
+
+def is_empty_stop_response(response: Any) -> bool:
+    """The condition ADK flags as MODEL_RETURNED_NO_CONTENT, checked on the
+    response before ADK sees it. Streaming is the caller's business: a
+    terminal finish-only chunk legitimately follows streamed content."""
+    if getattr(response, "partial", False) or getattr(response, "error_code", None):
+        return False
+    from google.genai import types as genai_types
+
+    if getattr(response, "finish_reason", None) not in (genai_types.FinishReason.STOP, "STOP"):
+        return False
+    content = getattr(response, "content", None)
+    return not content or not getattr(content, "parts", None)
+
+
+def meter_response_usage(response: Any) -> None:
+    """Charges a response's usage to the run budget from inside the model
+    layer. The pipeline meters from events, and a response the model layer
+    swallows never becomes one; without this a retried empty turn would be
+    free as far as the budget could tell. A budget ceiling crossed here
+    raises BudgetExceededError, which is the point."""
+    from core.context import current_run_context
+
+    ctx = current_run_context.get()
+    controller = getattr(ctx, "budget_controller", None) if ctx else None
+    usage = getattr(response, "usage_metadata", None)
+    total = int(getattr(usage, "total_token_count", 0) or 0) if usage else 0
+    if controller is None or total <= 0:
+        return
+    cached = int(getattr(usage, "cached_content_token_count", 0) or 0)
+    # The weight of a cached token is the run budget's to decide (a CI run
+    # counts every token at full price); this layer only reports the counts.
+    controller.record_tokens(total, cached_count=cached)
 
 
 class ContextBudgetExceededError(RuntimeError):
@@ -574,27 +640,56 @@ def _largest_message_summary(messages: Any) -> str:
     )
 
 
+def resolve_input_token_cap() -> Optional[int]:
+    """An absolute per-request input ceiling from MANTIS_MAX_INPUT_TOKENS, or None.
+
+    The window-relative guard below bounds a request by the MODEL's limit, which is
+    whatever the model happens to have (a million tokens, say) and nothing at all for a
+    model litellm does not know. This cap is the OPERATOR's limit: a number of tokens
+    one request may carry regardless of model, so the cost of one call has a ceiling
+    that does not move when the model changes and does not vanish behind a gateway.
+    Unset, empty, zero, or unparsable means no cap, which is the previous behaviour.
+    """
+    raw = str(os.environ.get("MANTIS_MAX_INPUT_TOKENS", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def enforce_context_budget(model: Any, messages: Any, tools: Any = None) -> None:
-    """Refuses a request that cannot fit the model's context window, before dispatching it."""
+    """Refuses a request that cannot fit the model's context window, or that exceeds the
+    operator's per-request input cap, before dispatching it."""
     limit = resolve_context_limit(model)
-    if not limit:
+    cap = resolve_input_token_cap()
+    if not limit and not cap:
         return
 
     estimated = estimate_prompt_tokens(messages, tools)
-    budget = int(limit * _CONTEXT_BUDGET_RATIO)
+    window_budget = int(limit * _CONTEXT_BUDGET_RATIO) if limit else None
+    budget = min(b for b in (window_budget, cap) if b is not None)
     if estimated <= budget:
         return
 
+    capped = cap is not None and (window_budget is None or cap <= window_budget)
+    if capped:
+        reason = (f"Request to '{model}' exceeds the per-request input cap: estimated "
+                  f"~{estimated:,} input tokens against MANTIS_MAX_INPUT_TOKENS={cap:,}.")
+    else:
+        reason = (f"Request to '{model}' is too large for its context window: estimated "
+                  f"~{estimated:,} input tokens against a {limit:,}-token window "
+                  f"({estimated / limit:.1f}x the window, budget {budget:,}).")
     raise ContextBudgetExceededError(
-        f"Request to '{model}' is too large for its context window: estimated "
-        f"~{estimated:,} input tokens against a {limit:,}-token window "
-        f"({estimated / limit:.1f}x the window, budget {budget:,})."
-        f"{_largest_message_summary(messages)}"
+        reason
+        + f"{_largest_message_summary(messages)}"
         " Refused before dispatch; retrying the identical request cannot succeed. "
         "Narrow the tool output feeding this node (for example, pass a 'directory' to "
         "list_files or a smaller range to read_file).",
         estimated_tokens=estimated,
-        limit=limit,
+        limit=cap if capped else limit,
     )
 
 
@@ -1728,6 +1823,15 @@ class ResilientLiteLlm(LiteLlm):
                         and "Tool call arguments were truncated" in str(getattr(response, "error_message", ""))
                     ):
                         raise MantisStreamingTruncationError(str(getattr(response, "error_message", "")))
+                    if not current_stream and is_empty_stop_response(response):
+                        # Billed, so charged, before the turn is thrown away.
+                        # A budget ceiling crossed here raises past the
+                        # retry loop below, which does not retry that.
+                        meter_response_usage(response)
+                        raise MantisEmptyResponseError(
+                            "The model returned no content (finish_reason=STOP with empty parts)",
+                            response=response,
+                        )
                     yield self._sanitize_structured_response(response, schema_cls)
                 return
             except (json.decoder.JSONDecodeError, ValueError, MantisStreamingTruncationError) as e:
@@ -1794,6 +1898,21 @@ class ResilientLiteLlm(LiteLlm):
                     ) from None
 
                 elapsed = time.time() - start_time
+                if isinstance(e, MantisEmptyResponseError) and elapsed >= max_patience:
+                    # Out of patience: hand the empty turn on as it was, so ADK
+                    # reports MODEL_RETURNED_NO_CONTENT and the campaign fails
+                    # the way it did before this retry existed. --resume picks
+                    # that up; an exception here would turn one known failure
+                    # mode into another.
+                    model_name = str(getattr(self, "model", getattr(llm_request, "model", "llm")))
+                    print(
+                        f"\n[LLM RETRY] '{model_name}' still returned no content after "
+                        f"{elapsed:.0f}s of retries; passing the empty turn on.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    yield self._sanitize_structured_response(e.response, schema_cls)
+                    return
                 if not is_retryable_llm_error(e) or elapsed >= max_patience:
                     raise
 
@@ -1978,26 +2097,36 @@ def get_llm_kwargs(
         if project:
             llm_kwargs["vertex_project"] = project
             llm_kwargs["vertex_location"] = location
-        # Relax safety filters for Gemini models that sometimes trigger erroneously on
-        # defensive security analysis and vulnerability remediation workflows.
-        if "gemini" in resolved_model:
-            safety_settings = [
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            ]
-            llm_kwargs["safety_settings"] = safety_settings
-            try:
-                import litellm
-                litellm.vertex_ai_safety_settings = safety_settings
-            except Exception:
-                pass
 
         if os.environ.get("VERTEX_FLEX") in ("1", "true", "True") or os.environ.get("VERTEXAI_SERVICE_TIER", "").lower() == "flex":
             headers = llm_kwargs.get("extra_headers") or {}
             headers["X-Vertex-AI-LLM-Request-Type"] = "shared"
             llm_kwargs["extra_headers"] = headers
+
+    # Relax the category filters for Gemini models, which sometimes trigger on
+    # defensive security analysis and vulnerability remediation. Applied on
+    # every route that reaches a Gemini model natively (vertex_ai/ and
+    # gemini/), not only Vertex: the Gemini API route used to run with the
+    # provider defaults, so the same prompt could be filtered through an API
+    # key and pass through a project. Keyed on the provider prefix, not on
+    # the substring "gemini": a Gemini model behind an OpenAI-compatible
+    # gateway (openai/gemini-*) takes OpenAI parameters, and litellm rejects
+    # this one there. The litellm global stays Vertex-scoped; it only exists
+    # for callers that bypass these kwargs.
+    if resolved_model.startswith(("gemini/", "vertex_ai/")) and "gemini" in resolved_model:
+        safety_settings = [
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        ]
+        llm_kwargs["safety_settings"] = safety_settings
+        if resolved_model.startswith("vertex_ai/"):
+            try:
+                import litellm
+                litellm.vertex_ai_safety_settings = safety_settings
+            except Exception:
+                pass
 
     return resolved_model, llm_kwargs
 

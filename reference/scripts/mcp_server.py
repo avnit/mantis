@@ -8,7 +8,7 @@ budget-capped scoped scan that runs the full Mantis pipeline over a change
 set in the background. The intended loop: edit, call mantis_check_change on
 the diff, fix or verify what it raises, and let mantis_scan_change audit
 the touched files in parallel; the next check_change sees whatever the scan
-found, because both read the same per-repo .mantis/knowledge.db.
+found, because both read the same per-repository knowledge database.
 
 Design rules, in force everywhere in this file:
 
@@ -19,7 +19,8 @@ Design rules, in force everywhere in this file:
   scan has ever covered yields REVIEW with instructions -- never PASS. PASS
   means "every check ran and nothing known intersects this change", not
   "secure".
-- Nothing writes outside the repo's .mantis/ directory, and read-only
+- Nothing writes into the repository, ever: state lives in a per-repository
+  directory outside it (see MantisState), and read-only
   tools write nothing at all: sqlite3.connect() creates files, so every
   read path checks existence before opening.
 """
@@ -71,6 +72,18 @@ MAX_WAIT_SECONDS = 60.0
 # Line proximity window around a diff hunk for findings outside any function.
 DIFF_LINE_PROXIMITY = 3
 
+# Where per-repository state lives when --state-dir is not given: a directory
+# under this path, keyed by the repository. Defaults to <workspace>/mcp.
+MCP_STATE_DIR_ENV = "MANTIS_MCP_STATE_DIR"
+
+# Ceilings on what one mantis_scan_change call may start. The caller is the
+# operator's own agent, but an agent under prompt injection can call a tool
+# in a loop; without these, N calls were N concurrent pipelines each allowed
+# any --max-llm-calls the caller named.
+MAX_SCAN_LLM_CALLS = 500
+MAX_SCAN_FILES = 50
+MAX_CONCURRENT_SCANS = 2
+
 VERDICT_PASS = "PASS"
 VERDICT_REVIEW = "REVIEW"
 VERDICT_BLOCK = "BLOCK"
@@ -79,23 +92,77 @@ _VERDICT_RANK = {VERDICT_PASS: 0, VERDICT_REVIEW: 1, VERDICT_BLOCK: 2}
 
 
 class MantisState:
-    """Per-repo paths and live scan registry for one server process."""
+    """Per-repo paths and live scan registry for one server process.
 
-    def __init__(self, repo_root: str):
+    State -- the knowledge database, the structural catalog, scan logs, the
+    resolutions audit log -- lives OUTSIDE the repository it describes, in a
+    per-repository directory under the Mantis workspace (or under
+    MANTIS_MCP_STATE_DIR / --state-dir). The repository is the code under
+    audit, and in the general case it is somebody else's: a committed symlink
+    at a predictable path under `<repo>/.mantis/` turned every state write
+    into a write to any file the server's user could reach, and a committed
+    database or catalog was trusted as the server's own memory and could
+    hand the change gate a PASS. Keeping state out of the tree closes both.
+    """
+
+    def __init__(self, repo_root: str, home: Optional[str] = None):
         self.repo = Path(repo_root).resolve()
-        self.home = self.repo / ".mantis"
+        self.home = self._default_home(self.repo, home)
         self.db_path = str(self.home / "knowledge.db")
         self.scans: Dict[str, Dict[str, Any]] = {}
         self._scan_events: Dict[str, threading.Event] = {}
         self._lock = threading.Lock()
 
+    @staticmethod
+    def _default_home(repo: Path, explicit: Optional[str]) -> Path:
+        import hashlib
+
+        from core.paths import workspace_dir
+
+        if explicit:
+            return Path(explicit).expanduser().resolve()
+        base = os.environ.get(MCP_STATE_DIR_ENV, "").strip()
+        root = Path(base).expanduser().resolve() if base else workspace_dir() / "mcp"
+        # One directory per repository path, so two checkouts never share a
+        # catalog; keyed by hash so the directory name is always a safe one.
+        return root / hashlib.sha256(str(repo).encode("utf-8")).hexdigest()[:16]
+
+    def check_home(self) -> str:
+        """Why the state directory is unusable, or "" when it is fine.
+
+        Refused: a state directory inside the repository (the repository's
+        author could then plant it), or one that is or traverses a symlink.
+        """
+        try:
+            resolved = self.home.resolve()
+        except OSError as exc:
+            return f"state directory '{self.home}' cannot be resolved: {exc}"
+        if resolved == self.repo or self.repo in resolved.parents:
+            return (f"state directory '{self.home}' is inside the repository; state must "
+                    f"live outside the code under audit (set --state-dir or "
+                    f"{MCP_STATE_DIR_ENV}).")
+        from core.paths import validate_data_path
+
+        ok, why = validate_data_path(self.home)
+        return "" if ok is not None else why
+
     def ensure_home(self) -> None:
-        """Creates .mantis/ and the knowledge database. Write paths only."""
+        """Creates the state directory and the knowledge database. Write paths only."""
+        problem = self.check_home()
+        if problem:
+            raise PermissionError(problem)
         self.home.mkdir(parents=True, exist_ok=True)
         if not os.path.exists(self.db_path):
             from core.database import init_db
 
             init_db(self.db_path)
+
+    def open_log(self, name: str):
+        """Append handle on a log under the state directory that must be a
+        regular file: a symlink there is refused rather than followed."""
+        path = self.home / name
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        return os.fdopen(os.open(str(path), flags, 0o600), "a", encoding="utf-8")
 
     def db_exists(self) -> bool:
         return os.path.exists(self.db_path)
@@ -302,7 +369,7 @@ def resolve_finding(state: MantisState, finding_id: int, resolution: str,
     update_finding_status_by_id(state.db_path, fid, str(row.get("run_id") or ""), res)
     new_status = str((row_for(fid) or {}).get("status") or "")
     applied = new_status.lower() == res
-    with open(state.home / "resolutions.log", "a", encoding="utf-8") as fh:
+    with state.open_log("resolutions.log") as fh:
         fh.write(json.dumps({
             "at": time.time(),
             "finding_id": fid,
@@ -331,15 +398,48 @@ def resolve_finding(state: MantisState, finding_id: int, resolution: str,
 # --- The gate ---------------------------------------------------------------------
 
 
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 def parse_unified_diff(diff_text: str) -> Dict[str, List[int]]:
-    """New-side changed line numbers per file from a unified diff. Never raises."""
+    """New-side changed line numbers per file from a unified diff. Never raises.
+
+    File headers are recognized only between hunks. Inside a hunk the
+    `@@ -a,b +c,d @@` counts say exactly how many old-side and new-side lines
+    follow, and every one of them is content -- including a content line
+    that reads `+++ b/other.py`, which the author of the diffed file
+    controls. Treating such a line as a header would re-attribute the rest
+    of the file's hunks to another path, or to nothing.
+    """
     changed: Dict[str, List[int]] = {}
     current = ""
     new_line = 0
+    old_left = 0  # old-side lines still owed by the open hunk
+    new_left = 0  # new-side lines still owed by the open hunk
     for raw in str(diff_text or "").splitlines():
+        in_hunk = old_left > 0 or new_left > 0
+        if in_hunk:
+            if raw.startswith("\\"):
+                continue  # "\ No newline at end of file": not a counted line
+            if raw.startswith("+"):
+                if current:
+                    changed[current].append(new_line)
+                new_line += 1
+                new_left -= 1
+            elif raw.startswith("-"):
+                # Old-side line: the new-side counter does not advance, but
+                # the deletion itself anchors here -- a hunk that only
+                # removes lines (the deleted-guard regression) must still map
+                # to its enclosing function, or the blast radius comes back
+                # empty.
+                if current:
+                    changed[current].append(max(1, new_line))
+                old_left -= 1
+            else:
+                new_line += 1
+                old_left -= 1
+                new_left -= 1
+            continue
         if raw.startswith("+++ "):
             path = raw[4:].strip()
             path = path.split("\t")[0]
@@ -351,23 +451,10 @@ def parse_unified_diff(diff_text: str) -> Dict[str, List[int]]:
             continue
         m = _HUNK_RE.match(raw)
         if m:
-            new_line = int(m.group(1))
+            old_left = int(m.group(1)) if m.group(1) is not None else 1
+            new_line = int(m.group(2))
+            new_left = int(m.group(3)) if m.group(3) is not None else 1
             continue
-        if not current or new_line <= 0:
-            continue
-        if raw.startswith("+") and not raw.startswith("+++"):
-            changed[current].append(new_line)
-            new_line += 1
-        elif raw.startswith("-") and not raw.startswith("---"):
-            # Old-side line: the new-side counter does not advance, but the
-            # deletion itself anchors here -- a hunk that only removes lines
-            # (the deleted-guard regression) must still map to its enclosing
-            # function, or the blast radius comes back empty.
-            changed[current].append(max(1, new_line))
-        elif raw.startswith("\\"):
-            continue  # "\ No newline at end of file"
-        else:
-            new_line += 1
     return {f: sorted(set(lines)) for f, lines in changed.items()}
 
 
@@ -420,7 +507,9 @@ def _uncovered(state: MantisState, rel_files: List[str]) -> Optional[List[str]]:
 
 
 def check_change(state: MantisState, files: Optional[List[str]] = None,
-                 diff: str = "") -> Dict[str, Any]:
+                 diff: str = "", renamed: Optional[Dict[str, str]] = None,
+                 deleted: Optional[List[str]] = None,
+                 include_coverage: bool = True) -> Dict[str, Any]:
     """The deterministic gate: what Mantis knows about this change, as a verdict.
 
     BLOCK  -- an open HIGH/CRITICAL finding intersects the change.
@@ -429,6 +518,21 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
               never been scanned, or the index/database needed to decide is
               missing (fail-closed).
     PASS   -- every check ran and nothing known intersects this change.
+
+    `renamed` ({old path: new path}) and `deleted` ([old path]) say what the
+    change did to paths the database may hold findings at. A finding at a
+    renamed path is judged against the new path, as direct: the code moved,
+    the finding did not go away. A finding at a deleted path is a REVIEW:
+    the code may have moved somewhere a rename could not be detected.
+    Without these, renaming a file would take its findings out of the
+    gate's sight, and renaming is cheaper than fixing.
+
+    `include_coverage=False` keeps the coverage checks -- never scanned,
+    index or database missing, paths outside the repository, ledger
+    unreadable -- OUT of the verdict and returns them under `coverage_gaps`
+    instead, for a caller that accounts for coverage itself and decides
+    separately whether a gap fails its job. The verdict is then a function
+    of findings only. The default folds them in as REVIEW, as before.
     """
     raw_changed: Dict[str, List[int]] = parse_unified_diff(diff)
     for f in files or []:
@@ -442,10 +546,17 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
         elif f:
             rejected.append(f)
     changed = {f: sorted(set(lines)) for f, lines in changed.items()}
+    moved: Dict[str, str] = {}
+    for old, new in (renamed or {}).items():
+        o, n = state.rel(old), state.rel(new)
+        if o and n:
+            moved[o] = n
+    removed = [r for r in (state.rel(d) for d in (deleted or [])) if r]
 
     verdict = VERDICT_PASS
     reasons: List[str] = []
     next_actions: List[str] = []
+    coverage_gaps: List[Dict[str, str]] = []
 
     def raise_to(level: str, reason: str, action: str = "") -> None:
         nonlocal verdict
@@ -455,26 +566,31 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
         if action and action not in next_actions:
             next_actions.append(action)
 
-    if not changed and not rejected:
+    def gap(reason: str, action: str = "", file: str = "") -> None:
+        coverage_gaps.append({"file": file, "reason": reason, "action": action})
+        if include_coverage:
+            raise_to(VERDICT_REVIEW, reason, action)
+
+    if not changed and not rejected and not removed:
         return {"verdict": VERDICT_REVIEW,
                 "reasons": ["No changed files given: pass `files` or a unified `diff`."],
-                "blast_radius": [], "findings": [], "next_actions": []}
+                "blast_radius": [], "findings": [], "next_actions": [],
+                "coverage_gaps": [{"file": "", "reason": "No changed files given.", "action": ""}]}
 
     # A path the gate cannot map into this repo is named, not dropped:
     # silently narrowing the change set is the fail-open direction.
     for f in rejected:
-        raise_to(VERDICT_REVIEW,
-                 f"'{f}' is outside this repository: not gated.",
-                 "Run the gate from the repository the change belongs to.")
+        gap(f"'{f}' is outside this repository: not gated.",
+            "Run the gate from the repository the change belongs to.", file=f)
 
     # Fail-closed context checks.
     idx = state.index()
     if not idx.available():
-        raise_to(VERDICT_REVIEW, "Structural index missing: blast radius unknown.",
-                 "Run mantis_reindex, then re-run mantis_check_change.")
+        gap("Structural index missing: blast radius unknown.",
+            "Run mantis_reindex, then re-run mantis_check_change.")
     if not state.db_exists():
-        raise_to(VERDICT_REVIEW, "No findings database: change set has never been audited.",
-                 "Run mantis_scan_change on the changed files.")
+        gap("No findings database: change set has never been audited.",
+            "Run mantis_scan_change on the changed files.")
 
     # Blast radius: changed lines -> enclosing functions -> direct callers.
     blast: List[Dict[str, Any]] = []
@@ -519,9 +635,27 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
                 continue
             f_fp = str(f.get("filepath") or "")
             matched_files = [c for c in changed if _finding_matches(state, f_fp, c)]
+            # A finding at a path this change renamed belongs to the new
+            # path now, and to every changed line of it: the lines it was
+            # recorded at mean nothing after the move.
+            via_rename = ""
+            if not matched_files:
+                for old, new in moved.items():
+                    if _paths_match(f_fp, old) and new in changed:
+                        matched_files = [new]
+                        via_rename = old
+                        break
             in_file = bool(matched_files)
             in_radius = not in_file and any(_finding_matches(state, f_fp, r) for r in radius_files)
             if not in_file and not in_radius:
+                if any(_paths_match(f_fp, d) for d in removed):
+                    sev = str(f.get("severity") or f.get("priority") or "").upper()
+                    raise_to(VERDICT_REVIEW,
+                             f"Open finding '{f.get('title')}' ({sev or 'unrated'}) was in "
+                             f"{f_fp}, which this change deletes: confirm the code is gone, "
+                             f"not moved.",
+                             "Check where the deleted file's code went; dismiss the finding "
+                             "with evidence if it is gone.")
                 continue
 
             # When a diff gives changed line numbers and the finding records its
@@ -532,8 +666,8 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
             # two-line registration in a legacy router does not block on eight
             # unrelated findings 400 lines away). Missing line info on either
             # side fails closed to "direct".
-            direct = False
-            if in_file:
+            direct = bool(via_rename)
+            if in_file and not via_rename:
                 diff_lines = sorted({
                     ln for c in matched_files for ln in (changed.get(c) or [])
                 })
@@ -566,9 +700,13 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
                 view["relationship"] = "caller_radius"
             hits.append(view)
             sev = str(f.get("severity") or f.get("priority") or "").upper()
+            if via_rename:
+                view["filepath"] = matched_files[0]
+                view["renamed_from"] = via_rename
             if direct and sev in BLOCKING_SEVERITIES:
+                where = (f"{matched_files[0]} (renamed from {via_rename})" if via_rename else f_fp)
                 raise_to(VERDICT_BLOCK,
-                         f"Open {sev} finding '{f.get('title')}' touches changed file {f_fp}.",
+                         f"Open {sev} finding '{f.get('title')}' touches changed file {where}.",
                          "Fix the finding (or mark it false_positive with evidence) before merging.")
             elif in_file:
                 raise_to(VERDICT_REVIEW,
@@ -582,17 +720,32 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
                          f"caller radius: {f_fp}.",
                          "Review the listed findings against this change.")
 
+        # Archived findings on a touched file: found here once, shelved when
+        # the code changed and a rescan did not report them again. Listed as
+        # hits with their own relationship so the caller can show them as
+        # notices; never a verdict, because an archived finding is a hint to
+        # look again, not a claim about the current code.
+        from core.database import ARCHIVED_STATUS
+
+        for f in read_findings(state.db_path):
+            if str(f.get("status") or "").lower() != ARCHIVED_STATUS:
+                continue
+            f_fp = str(f.get("filepath") or "")
+            if not any(_finding_matches(state, f_fp, c) for c in changed):
+                continue
+            view = _finding_view(f)
+            view["relationship"] = "archived"
+            hits.append(view)
+
         # Coverage: a changed file no scan ever recorded is unknown ground.
         uncovered = _uncovered(state, list(changed))
         if uncovered is None:
-            raise_to(VERDICT_REVIEW,
-                     "Coverage ledger unreadable: scan history unknown.",
-                     "Check .mantis/knowledge.db, then run mantis_scan_change.")
+            gap("Coverage ledger unreadable: scan history unknown.",
+                "Check the knowledge database in the state directory, then run mantis_scan_change.")
         else:
             for rel_fp in uncovered:
-                raise_to(VERDICT_REVIEW,
-                         f"'{rel_fp}' has never been scanned by Mantis.",
-                         "Run mantis_scan_change on the changed files.")
+                gap(f"'{rel_fp}' has never been scanned by Mantis.",
+                    "Run mantis_scan_change on the changed files.", file=rel_fp)
 
     return {
         "verdict": verdict,
@@ -600,6 +753,7 @@ def check_change(state: MantisState, files: Optional[List[str]] = None,
         "blast_radius": blast,
         "findings": hits,
         "next_actions": next_actions,
+        "coverage_gaps": coverage_gaps,
     }
 
 
@@ -642,7 +796,24 @@ def scan_change(state: MantisState, files: List[str],
     if not rels:
         return {"error": "No scannable files inside the repository. "
                          "Pass repo-relative paths."}
-    state.ensure_home()
+    if len(rels) > MAX_SCAN_FILES:
+        return {"error": f"{len(rels)} files requested; a scan takes at most "
+                         f"{MAX_SCAN_FILES}. Split the change set."}
+    try:
+        max_llm_calls = int(max_llm_calls or 0)
+    except (TypeError, ValueError):
+        max_llm_calls = 0
+    # 0 or less would drop the --max-llm-calls flag and with it the cap.
+    max_llm_calls = min(max(max_llm_calls, 1), MAX_SCAN_LLM_CALLS)
+    with state._lock:
+        running = sum(1 for s in state.scans.values() if s.get("status") == "running")
+    if running >= MAX_CONCURRENT_SCANS:
+        return {"error": f"{running} scan(s) already running (limit {MAX_CONCURRENT_SCANS}); "
+                         "poll mantis_scan_status and retry when one finishes."}
+    try:
+        state.ensure_home()
+    except PermissionError as exc:
+        return {"error": str(exc)}
     scans_dir = state.home / "scans"
     scans_dir.mkdir(exist_ok=True)
     scan_id = uuid.uuid4().hex[:12]
@@ -663,7 +834,8 @@ def scan_change(state: MantisState, files: List[str],
     def _run() -> None:
         index_restored = False
         try:
-            with open(log_path, "ab") as log:
+            flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            with os.fdopen(os.open(str(log_path), flags, 0o600), "ab") as log:
                 for rel_fp in rels:
                     cmd = _scan_cmd(state, str(state.repo / rel_fp), max_llm_calls, model)
                     log.write(f"\n=== mantis scan {rel_fp} ===\n".encode())
@@ -777,7 +949,7 @@ def build_server(state: MantisState):
     def mantis_scan_change(files: List[str], max_llm_calls: int = 150, model: str = "") -> dict:
         """Launches the full Mantis audit pipeline over the given files in the
         background (budget-capped). Findings accumulate in the repo's
-        .mantis/knowledge.db, where mantis_check_change reads them."""
+        the per-repository knowledge database, where mantis_check_change reads them."""
         return scan_change(state, files, max_llm_calls=max_llm_calls, model=model)
 
     @srv.tool()
@@ -828,7 +1000,7 @@ def build_server(state: MantisState):
     def mantis_resolve_finding(finding_id: int, resolution: str, reason: str) -> dict:
         """Closes a finding with an operator verdict: 'mitigated' (the defect
         was fixed) or 'false_positive' (the report is wrong). Requires a
-        reason, which is appended to .mantis/resolutions.log as the audit
+        reason, which is appended to resolutions.log in the state directory as the audit
         trail. Machine statuses (patch_verified, dynamic_confirmed) remain
         reserved for the verification pipeline, and a dismissal never
         overwrites machine-verified evidence."""
@@ -847,10 +1019,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "JSON, exit 0=PASS 1=REVIEW 2=BLOCK.")
     parser.add_argument("--files", nargs="*", default=None,
                         help="Changed files for --check when no diff is piped.")
+    parser.add_argument("--state-dir", default="",
+                        help="Directory for this repository's knowledge database, catalog "
+                             f"and logs; must be outside the repository (default: "
+                             f"${MCP_STATE_DIR_ENV} or <workspace>/mcp, per repository)")
     args = parser.parse_args(argv)
-    state = MantisState(args.repo)
+    state = MantisState(args.repo, home=args.state_dir or None)
     if not state.repo.is_dir():
         print(f"error: --repo '{args.repo}' is not a directory", file=sys.stderr)
+        return 3
+    problem = state.check_home()
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
         return 3
     if args.check:
         diff = "" if sys.stdin.isatty() else sys.stdin.read()

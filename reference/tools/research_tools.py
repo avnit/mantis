@@ -137,7 +137,16 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
 
             if art is not None:
                 if len(art) > MAX_READ_SIZE:
-                    return art[:MAX_READ_SIZE] + f"\n\n[TRUNCATED: File exceeds {MAX_READ_SIZE} characters/bytes limit]"
+                    art = art[:MAX_READ_SIZE] + f"\n\n[TRUNCATED: File exceeds {MAX_READ_SIZE} characters/bytes limit]"
+                # An artifact that came in with a knowledge import is a file
+                # from the repository, not this run's own notes: it is read
+                # the way any repository file is, fenced as untrusted.
+                from core.database import artifact_is_imported
+                if artifact_is_imported(resolved_db, filepath=clean_path, run_id=ctx.run_id) or \
+                        artifact_is_imported(resolved_db, filepath=clean_path.removeprefix("workspace/"), run_id=ctx.run_id) or \
+                        (clean_path in ("workspace/kb/THREAT_MODEL.md", "workspace/THREAT_MODEL.md", "THREAT_MODEL.md")
+                         and artifact_is_imported(resolved_db, artifact_type="threat_model", run_id=ctx.run_id)):
+                    return wrap_untrusted_content(art, filename=clean_path)
                 return art
 
             # Check findings virtual paths
@@ -149,8 +158,9 @@ async def read_file(filepath: str, start_line: int = 0, end_line: int = 0) -> st
                         f_id = str(f.get("id"))
                         f_lineage = str(f.get("lineage_id") or "")
                         if finding_target in (f_id, f_lineage) or finding_target in ("*", "findings", ""):
-                            return json.dumps(f if finding_target not in ("*", "findings", "") else findings, indent=2)
-                    return json.dumps(findings, indent=2)
+                            payload = f if finding_target not in ("*", "findings", "") else findings
+                            return wrap_untrusted_content(json.dumps(payload, indent=2), filename=clean_path)
+                    return wrap_untrusted_content(json.dumps(findings, indent=2), filename=clean_path)
 
             # Check learnings virtual JSONL
             if clean_path in ("workspace/learnings.jsonl", "learnings.jsonl"):
@@ -282,10 +292,12 @@ def _protected_citation(rel_path: str) -> bool:
     become an oracle for them: a protected citation is treated as
     unverifiable (skipped entirely), never resolved, opened, or line-counted.
     """
-    parts = [p for p in str(rel_path or "").replace("\\", "/").split("/") if p]
+    parts = [p.lower() for p in str(rel_path or "").replace("\\", "/").split("/") if p]
     if not parts:
         return False
-    return any(p in PROTECTED_VCS_DIRS for p in parts) or parts[-1] in PROTECTED_METADATA_FILES
+    dirs = {d.lower() for d in PROTECTED_VCS_DIRS}
+    files = {f.lower() for f in PROTECTED_METADATA_FILES}
+    return any(p in dirs for p in parts) or parts[-1] in files
 
 
 def _resolve_citation(jail_root: str, rel_path: str, base_rel: str = "") -> "tuple[Optional[str], str]":
@@ -314,6 +326,68 @@ def _resolve_citation(jail_root: str, rel_path: str, base_rel: str = "") -> "tup
         probe = probe.split("/", 1)[1]
 
 
+def _isdir_in_jail(ctx, raw_fp: str) -> bool:
+    """os.path.isdir bounded to the jail. The unbounded form answered for any
+    host path the model named -- a directory-existence oracle over the
+    whole filesystem."""
+    jail = str(getattr(ctx, "jail_dir", "") or "")
+    if not jail:
+        return False
+    try:
+        jail_real = os.path.realpath(jail)
+        cand = os.path.realpath(os.path.join(jail_real, str(raw_fp or "").lstrip("/")))
+        if cand != jail_real and not cand.startswith(jail_real + os.sep):
+            return False
+        return os.path.isdir(cand)
+    except (OSError, ValueError):
+        return False
+
+
+def _names_single_target(cited: str, jail_root: str, single_target: str) -> bool:
+    """Lexically, does a citation name the scanned file? No filesystem probing,
+    so a wrong guess learns nothing."""
+    clean = str(cited or "").replace("\\", "/").removeprefix("./").strip().lstrip("/")
+    try:
+        target_rel = os.path.relpath(single_target, jail_root).replace("\\", "/")
+    except ValueError:
+        return False
+    return clean == target_rel or clean.endswith("/" + target_rel) or clean == os.path.basename(target_rel)
+
+
+def _citation_readable(jail_root: str, host_path: str, single_target: str = "") -> bool:
+    """Whether the verifier may open a resolved citation: the gates read_file
+    enforces, applied here so the verifier is never an oracle for what
+    read_file refuses.
+
+    - Single-file scans may only verify the scanned file. read_file refuses
+      siblings; the verifier used to line-count `.ssh/id_ed25519` next to
+      the target and confirm guessed identifiers in it.
+    - The resolved, case-folded path may not be VCS internals or credential
+      metadata. _protected_citation checks the spelling the model gave; a
+      symlink alias (`notes.txt -> .git/config`) or a different case on a
+      case-insensitive filesystem walked past it.
+    - No symlink anywhere on the in-jail path: read_file refuses symlinked
+      leaves, so a citation through one is unverifiable, not verified.
+    """
+    try:
+        if single_target and os.path.realpath(host_path) != single_target:
+            return False
+        rel = os.path.relpath(os.path.realpath(host_path), jail_root)
+        parts = [p.lower() for p in rel.replace("\\", "/").split("/") if p]
+        protected_dirs = {d.lower() for d in PROTECTED_VCS_DIRS}
+        protected_files = {f.lower() for f in PROTECTED_METADATA_FILES}
+        if any(p in protected_dirs for p in parts) or (parts and parts[-1] in protected_files):
+            return False
+        probe = jail_root
+        for part in rel.split(os.sep):
+            probe = os.path.join(probe, part)
+            if os.path.islink(probe):
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _citation_text(host_path: str) -> Optional[str]:
     """File text for citation checks, or None when unverifiable."""
     try:
@@ -328,7 +402,8 @@ def _citation_text(host_path: str) -> Optional[str]:
         return None
 
 
-def _check_finding_citations(f: Any, idx: int, jail_root: str, base_rel: str, problems: "list[str]") -> None:
+def _check_finding_citations(f: Any, idx: int, jail_root: str, base_rel: str, problems: "list[str]",
+                             single_target: str = "") -> None:
     """Appends one message per provably false citation in a single finding."""
     f_dict = f.model_dump() if hasattr(f, "model_dump") else (f if isinstance(f, dict) else dict(f))
     title = f_dict.get("title") or f"Finding #{idx + 1}"
@@ -336,9 +411,14 @@ def _check_finding_citations(f: Any, idx: int, jail_root: str, base_rel: str, pr
     if fp and not _protected_citation(fp):
         host, repaired = _resolve_citation(jail_root, fp, base_rel)
         if host is None:
-            problems.append(
-                f"Finding '{title}': filepath '{fp}' does not resolve to a file in the target"
-            )
+            if single_target and not _names_single_target(fp, jail_root, single_target):
+                pass  # not the scanned file: say nothing about whether it exists
+            else:
+                problems.append(
+                    f"Finding '{title}': filepath '{fp}' does not resolve to a file in the target"
+                )
+        elif not _citation_readable(jail_root, host, single_target):
+            pass  # read_file would refuse it; the verifier stays equally silent
         else:
             clean_fp = fp.replace("\\", "/").removeprefix("./").lstrip("/")
             if repaired != clean_fp:
@@ -379,9 +459,13 @@ def _check_finding_citations(f: Any, idx: int, jail_root: str, base_rel: str, pr
             continue
         host, _ = _resolve_citation(jail_root, path_part, base_rel)
         if host is None:
+            if single_target and not _names_single_target(path_part, jail_root, single_target):
+                continue  # not the scanned file: no existence oracle
             problems.append(
                 f"Finding '{title}': code_paths entry '{entry}' cites a file that does not exist in the target"
             )
+            continue
+        if not _citation_readable(jail_root, host, single_target):
             continue
         text = _citation_text(host)
         if text is None:
@@ -437,9 +521,18 @@ def _citation_problems(findings: Any, jail_dir: str, target_file: str = "",
                 jail_root = p_real
     except OSError:
         pass
+    # Single-file scan: the one file read_file will open is the only file
+    # the verifier may open or speak about.
+    single_target = ""
+    try:
+        if target_file and os.path.isfile(target_file):
+            single_target = os.path.realpath(target_file)
+    except OSError:
+        single_target = ""
     for i, f in enumerate(findings):
         try:
-            _check_finding_citations(f, i, jail_root, base_rel, problems)
+            _check_finding_citations(f, i, jail_root, base_rel, problems,
+                                     single_target=single_target)
         except Exception as exc:  # unverifiable is not wrong
             logger.warning("Citation check skipped for finding %d: %r", i, exc)
     return problems
@@ -472,7 +565,7 @@ def report_findings(report: VulnerabilityReport) -> str:
                     is_dir_or_root = True
                 elif ctx.target_file and clean_fp == ctx.target_file.rstrip("/") and os.path.isdir(ctx.target_file):
                     is_dir_or_root = True
-                elif os.path.isdir(raw_fp):
+                elif _isdir_in_jail(ctx, raw_fp):
                     is_dir_or_root = True
 
             if not raw_fp or is_dir_or_root:
@@ -536,7 +629,8 @@ def report_findings(report: VulnerabilityReport) -> str:
                 "report via report_findings."
             )
 
-        write_findings(ctx.db_path, ctx.target_file, findings, run_id=ctx.run_id)
+        write_findings(ctx.db_path, ctx.target_file, findings, run_id=ctx.run_id,
+                       verified_evidence=bool(getattr(ctx, "sandbox_executed", False)))
         return f"SUCCESS: Saved {len(findings)} finding(s) to database."
     except Exception as e:
         return f"ERROR SAVING DB: {e}"
@@ -576,7 +670,12 @@ def get_findings(filepath: str = "") -> str:
         if not findings:
             target_desc = f" for '{filepath}'" if filepath else ""
             return f"NO_DATA: Zero findings recorded in database{target_desc}."
-        return json.dumps(findings, indent=2)
+        # CP-4: a finding's title and description were written by a model
+        # that had just read the target, so this is target content by proxy
+        # and reaches the reviewer, critic, calibrator and reporter. Fenced
+        # like every other model-to-model channel (memory, correlator,
+        # planner), not handed to the gate stages as bare text.
+        return wrap_untrusted_content(json.dumps(findings, indent=2), filename="recorded_findings")
     except Exception as e:
         return f"ERROR RETRIEVING FINDINGS: {e}"
 
@@ -846,6 +945,7 @@ async def list_files(directory: str = "") -> str:
     if ctx.sandbox is not None and hasattr(ctx.sandbox, "list_files"):
         try:
             files = await ctx.sandbox.list_files(directory)
+            files = _without_excluded(ctx, files)
             return _bounded_listing(sorted(files), directory)
         except PermissionError as pe:
             return f"Error: Permission denied. {pe}"
@@ -878,9 +978,23 @@ async def list_files(directory: str = "") -> str:
                 if not fn.startswith("."):
                     rel = os.path.relpath(os.path.join(root, fn), base_dir)
                     files.append(rel)
+        files = _without_excluded(ctx, files)
         return _bounded_listing(sorted(files), directory)
     except Exception as e:
         return f"Error listing files: {e}"
+
+
+def _without_excluded(ctx, rel_paths):
+    """Listings minus the operator's exclusions (core.exclusions). Paths are
+    relative to the scan target, which is what the patterns are written
+    against. Reading an excluded file is still allowed; it is simply not
+    offered."""
+    patterns = tuple(getattr(ctx, "exclude", ()) or ())
+    if not patterns:
+        return list(rel_paths)
+    from core.exclusions import is_excluded
+
+    return [p for p in rel_paths if not is_excluded(str(p), patterns)]
 
 
 def record_plan(plan: dict) -> str:
@@ -907,7 +1021,8 @@ def get_plan() -> str:
     if not art:
         art = read_artifact(ctx.db_path, filepath="workspace/plan.json", run_id=ctx.run_id)
     if art:
-        return art
+        # Model-written after reading the target: fenced like get_findings.
+        return wrap_untrusted_content(art, filename="recorded_plan")
     return "NO_DATA: No review plan recorded in database."
 
 
@@ -955,7 +1070,7 @@ def get_threat_model() -> str:
     if not art:
         art = read_artifact(ctx.db_path, filepath="workspace/kb/THREAT_MODEL.md", run_id=ctx.run_id)
     if art:
-        return art
+        return wrap_untrusted_content(art, filename="recorded_threat_model")
     return "NO_DATA: No threat model recorded in database."
 
 
@@ -998,12 +1113,12 @@ def get_summary() -> str:
         if not kb_arch:
             kb_arch = read_artifact(ctx.db_path, filepath="workspace/kb/index.md", run_id=ctx.run_id)
         if kb_arch:
-            return kb_arch
+            return wrap_untrusted_content(kb_arch, filename="recorded_summary")
         if art and not is_empty_summary:
-            return art
+            return wrap_untrusted_content(art, filename="recorded_summary")
 
     if art and not is_empty_summary:
-        return art
+        return wrap_untrusted_content(art, filename="recorded_summary")
     return "NO_DATA: No codebase summary recorded in database."
 
 

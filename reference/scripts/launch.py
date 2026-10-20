@@ -23,9 +23,9 @@ if _REF_ROOT not in sys.path:
     sys.path.insert(0, _REF_ROOT)
 
 from core.budget import BudgetConfig, parse_duration_seconds, parse_token_budget
-from core.config import MantisAuthError
+from core.config import EXIT_AUTH, MantisAuthError
 from core.synthesizer import ResearchGraphSynthesizer, WorkflowSynthesizer
-from main import pipeline
+from main import _SCAN_MODES, pipeline
 from scripts.configure import (
     detect_capabilities,
     ensure_configured,
@@ -39,9 +39,10 @@ from scripts.configure import (
 class _LauncherArgumentParser(argparse.ArgumentParser):
     """Exits 64 (EX_USAGE) on CLI usage errors instead of argparse's default 2.
 
-    Exit code 2 is documented by Mantis as "paused at budget" (and main.py
-    uses it that way), so a CI wrapper could not distinguish a typo'd flag
-    from a resumable pause on the launch.py path.
+    Exit code 2 is documented by Mantis as "paused at budget", so a CI
+    wrapper could not otherwise distinguish a typo'd flag from a resumable
+    pause. This is the only command-line parser: run.sh, scripts/launch.py
+    and main.py all go through it.
     """
 
     def error(self, message):
@@ -67,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         "-m",
         type=str,
-        help="Global LLM model override (e.g. gemini-3.7-flash, vertex_ai/claude-opus-5, openai/my-model)",
+        help="Global LLM model override (e.g. gemini-3.8-flash, vertex_ai/claude-opus-5, openai/my-model)",
     )
     parser.add_argument("--api-base", type=str, help="Custom LLM API Base URL for OpenAI-compatible models")
     parser.add_argument(
@@ -102,9 +103,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--token-budget",
+        "--max-tokens",
+        dest="token_budget",
         type=str,
         default=None,
-        help="Token consumption ceiling override before graceful pause (e.g. 10M, 5M, 500k, or 'unlimited'; defaults to workflow budget)",
+        help=(
+            "Run token ceiling, e.g. 10M, 500k, or 'unlimited' (defaults to the "
+            "workflow budget). Checked after each call against tokens weighted by "
+            "--cache-discount; the run pauses with exit 2 when reached."
+        ),
+    )
+    parser.add_argument(
+        "--cache-discount",
+        type=str,
+        default=None,
+        help=(
+            "Weight of a cached input token against the token ceiling, 0 to 1 (defaults to "
+            "the workflow budget, 0.1). Pass 1 to count every token at full price."
+        ),
+    )
+    parser.add_argument(
+        "--spend-report",
+        type=str,
+        default="",
+        help=(
+            "Write the run's token and call totals as JSON to this path on exit, "
+            "however the run ended (for a driver that allots this process a budget)."
+        ),
     )
     parser.add_argument(
         "--no-budget",
@@ -130,6 +155,79 @@ def build_parser() -> argparse.ArgumentParser:
             "Number of campaigns to run concurrently (default: 1, the "
             "sequential behaviour). Run-level budget ceilings are shared "
             "across workers; per-campaign guards stay per campaign."
+        ),
+    )
+    parser.add_argument(
+        "--db-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Seconds a knowledge-database write waits for the lock before "
+            "failing with 'database is locked' (default: 60, or 15 x "
+            "--parallel when that is larger; also MANTIS_DB_TIMEOUT)"
+        ),
+    )
+    parser.add_argument(
+        "--scan-mode",
+        type=str,
+        default=None,
+        choices=list(_SCAN_MODES),
+        help=(
+            "Scan mode. file-by-file asks one question of every file; "
+            "cross-functional hunts defects that span files. Defaults to the "
+            "workflow config, or auto."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip the work-plan confirmation prompt (for non-interactive use)",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        metavar="PATTERN",
+        help=(
+            "Leave matching paths out of the scan; repeatable, or comma-separated. "
+            "Patterns are relative to the target: a bare name (vendor, testdata) matches "
+            "a directory or file of that name at any depth, a pattern with a slash "
+            "(third_party/*, src/gen/*.pb.go) matches the relative path. Excluded files "
+            "are not scanned or listed but stay readable for context. Adds to the "
+            "workflow's `exclude` list."
+        ),
+    )
+    parser.add_argument(
+        "--path-root",
+        type=str,
+        default="",
+        help=(
+            "Directory to store finding filepaths relative to (e.g. the "
+            "repository root when scanning a single file inside it); must "
+            "be an ancestor of the target"
+        ),
+    )
+    parser.add_argument(
+        "--no-compaction",
+        action="store_true",
+        help="Disable ADK event compaction",
+    )
+    parser.add_argument(
+        "--no-context-cache",
+        action="store_true",
+        help="Disable ADK context caching",
+    )
+    parser.add_argument(
+        "--import-knowledge",
+        type=str,
+        default="",
+        metavar="DIR",
+        help=(
+            "Read a knowledge export (scripts/knowledge.py export; by convention "
+            ".mantis/knowledge in the repository) into the database before the run: prior "
+            "findings and their status, learnings, coverage, and the threat model and "
+            "architecture the run's tools then see. The files are treated as data."
         ),
     )
     parser.add_argument(
@@ -177,8 +275,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume",
         type=str,
+        nargs="?",
+        const="latest",
         default="",
-        help="Run ID to resume execution from where it paused",
+        metavar="RUN_ID",
+        help=(
+            "Resume a run: scan only the campaigns it has not completed (failed ones "
+            "and ones it never reached), under the same run id, with a fresh budget. "
+            "With no RUN_ID, the most recent run recorded for this target. To rescan "
+            "everything, start a new run instead."
+        ),
     )
     parser.add_argument(
         "--inspect",
@@ -253,6 +359,7 @@ def run_launch(
     no_budget: bool = False,
     no_replan: bool = False,
     parallel: int = 1,
+    db_timeout: Optional[float] = None,
     focus: str = "",
     seed_report: str = "",
     max_steps: Optional[int] = None,
@@ -263,6 +370,14 @@ def run_launch(
     inspect: bool = False,
     synthesize_llm: bool = True,
     save_config: bool = False,
+    scan_mode: Optional[str] = None,
+    assume_yes: bool = False,
+    exclude: Optional[list] = None,
+    path_root: str = "",
+    no_compaction: bool = False,
+    no_context_cache: bool = False,
+    cache_discount: Optional[float] = None,
+    import_knowledge: str = "",
 ) -> int:
     """Core launch workflow: auto-configures, preflights, and executes the Mantis pipeline."""
     if flex:
@@ -366,7 +481,7 @@ def run_launch(
         mode_str = "LLM-driven research graph synthesis" if synthesize_llm else "deterministic archetype"
         print(f"✨ Synthesizing targeted research graph for objective: '{objective}' (mode: {mode_str})...")
         synthesizer = ResearchGraphSynthesizer(
-            default_model=model or "vertex_ai/gemini-3.7-flash",
+            default_model=model or "vertex_ai/gemini-3.8-flash",
             db_path=db_path or "knowledge.db",
         )
         effective_sandbox = sandbox
@@ -455,6 +570,7 @@ def run_launch(
         max_node_visits=cli_budget_overrides.get("max_node_visits", wf_budget.max_node_visits),
         max_llm_calls=cli_budget_overrides.get("max_llm_calls", wf_budget.max_llm_calls),
         max_node_tool_calls=cli_budget_overrides.get("max_node_tool_calls", wf_budget.max_node_tool_calls),
+        cache_discount=cache_discount if cache_discount is not None else wf_budget.cache_discount,
     )
 
     # Build overrides dict
@@ -539,7 +655,7 @@ def run_launch(
         if effective_budget.max_node_tool_calls > 0:
             print(f"  • Max Node Tool Calls: {effective_budget.max_node_tool_calls}")
         if resume_run_id:
-            print(f"  • Resume Run ID: {resume_run_id}")
+            print(f"  • Resume Run ID: {'most recent run' if resume_run_id == 'latest' else resume_run_id}")
         return 0
 
     # Launch Pipeline
@@ -563,8 +679,17 @@ def run_launch(
                 max_node_tool_calls_override=cli_budget_overrides.get("max_node_tool_calls"),
                 enable_replan=False if no_replan else None,
                 parallel=parallel,
+                db_timeout=db_timeout,
                 focus=focus,
                 seed_report_path=seed_report,
+                scan_mode_override=scan_mode,
+                assume_yes=assume_yes,
+                exclude_override=exclude,
+                path_root=path_root,
+                enable_compaction=False if no_compaction else None,
+                enable_context_cache=False if no_context_cache else None,
+                cache_discount_override=cache_discount,
+                import_knowledge_dir=import_knowledge,
                 # Already paid for above. Surveying chromium costs ~65s; the pipeline
                 # would otherwise repeat it to answer the same question.
                 precomputed_astm=survey_astm,
@@ -572,45 +697,92 @@ def run_launch(
         )
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)
-        return 1
+        return EXIT_AUTH
 
 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    return run_launch(
-        target=args.target,
-        workflow_path=args.workflow,
-        objective=args.objective,
-        sandbox=args.sandbox,
-        model=args.model,
-        api_base=args.api_base,
-        reasoning_effort=args.reasoning_effort,
-        timeout=args.timeout,
-        db_path=args.db,
-        flex=args.flex,
-        auto_configure=not args.no_auto_configure,
-        preflight_only=args.preflight_only,
-        interactive=args.interactive,
-        dry_run=args.dry_run,
-        probe_llm=args.probe_llm,
-        max_time=args.max_time,
-        token_budget=args.token_budget,
-        no_budget=args.no_budget,
-        no_replan=args.no_replan,
-        parallel=args.parallel,
-        focus=args.focus,
-        seed_report=args.seed_report,
-        max_steps=args.max_steps,
-        max_node_visits=args.max_node_visits,
-        max_llm_calls=args.max_llm_calls,
-        max_node_tool_calls=args.max_node_tool_calls,
-        resume_run_id=args.resume,
-        inspect=args.inspect,
-        synthesize_llm=args.synthesize_llm,
-        save_config=args.save_config,
-    )
+    # Parsed here so a bad value is a usage error (exit 64), not a stack
+    # trace from inside the run and not exit 2, which means "paused at
+    # budget" and is what a driver watches for.
+    cache_discount = None
+    if args.cache_discount is not None:
+        try:
+            from core.budget import clamp_cache_discount
+
+            cache_discount = clamp_cache_discount(args.cache_discount)
+        except ValueError as exc:
+            parser.error(f"--cache-discount: {exc}")
+    if args.token_budget is not None:
+        try:
+            parse_token_budget(args.token_budget)
+        except ValueError as exc:
+            parser.error(f"--token-budget/--max-tokens: {exc}")
+    if args.max_time is not None:
+        try:
+            parse_duration_seconds(args.max_time)
+        except ValueError as exc:
+            parser.error(f"--max-time: {exc}")
+
+    # The spend report is written however the run ended -- a driver that
+    # allotted this process a budget needs the number even when the process
+    # was interrupted. An exit code of None means "killed before it could say".
+    from main import write_spend_report
+
+    exit_code: Optional[int] = None
+    try:
+        exit_code = run_launch(
+            target=args.target,
+            workflow_path=args.workflow,
+            objective=args.objective,
+            sandbox=args.sandbox,
+            model=args.model,
+            api_base=args.api_base,
+            reasoning_effort=args.reasoning_effort,
+            timeout=args.timeout,
+            db_path=args.db,
+            flex=args.flex,
+            auto_configure=not args.no_auto_configure,
+            preflight_only=args.preflight_only,
+            interactive=args.interactive,
+            dry_run=args.dry_run,
+            probe_llm=args.probe_llm,
+            max_time=args.max_time,
+            token_budget=args.token_budget,
+            no_budget=args.no_budget,
+            no_replan=args.no_replan,
+            parallel=args.parallel,
+            db_timeout=args.db_timeout,
+            focus=args.focus,
+            seed_report=args.seed_report,
+            max_steps=args.max_steps,
+            max_node_visits=args.max_node_visits,
+            max_llm_calls=args.max_llm_calls,
+            max_node_tool_calls=args.max_node_tool_calls,
+            resume_run_id=args.resume,
+            inspect=args.inspect,
+            synthesize_llm=args.synthesize_llm,
+            save_config=args.save_config,
+            scan_mode=args.scan_mode,
+            assume_yes=args.yes,
+            exclude=args.exclude,
+            path_root=args.path_root,
+            no_compaction=args.no_compaction,
+            no_context_cache=args.no_context_cache,
+            cache_discount=cache_discount,
+            import_knowledge=args.import_knowledge,
+        )
+    except MantisAuthError as ae:
+        print(f"\n{ae}", file=sys.stderr)
+        exit_code = EXIT_AUTH
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\nProcess aborted by user.")
+        exit_code = 130
+    finally:
+        write_spend_report(args.spend_report, exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":
@@ -618,7 +790,7 @@ if __name__ == "__main__":
         sys.exit(main())
     except MantisAuthError as ae:
         print(f"\n{ae}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_AUTH)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\nProcess aborted by user.")
         sys.exit(130)
